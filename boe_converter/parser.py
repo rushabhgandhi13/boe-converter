@@ -187,6 +187,22 @@ class PdfParser:
         """
         handle, pages, should_close = self._resolve(doc)
         try:
+            # Format detection: the legacy "Indian Customs EDI System V1.5R001"
+            # layout is line-based and structurally unlike the new ICEGATE
+            # format, so it is parsed by a dedicated parser. Detection reads the
+            # first page's text once; everything downstream is format-agnostic
+            # (both parsers return the same ExtractedDocument contract). Imported
+            # lazily to avoid a circular import (OldFormatParser uses _capture).
+            from boe_converter.old_format_parser import (  # noqa: PLC0415
+                OldFormatParser,
+                is_old_format,
+            )
+
+            if pages and is_old_format(pages[0].extract_text() or ""):
+                return OldFormatParser().parse(
+                    pages, company_name=company_name, usd_rate=usd_rate
+                )
+
             header, header_flags = self._extract_header(
                 pages, company_name=company_name, usd_rate=usd_rate
             )

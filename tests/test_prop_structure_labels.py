@@ -33,6 +33,9 @@ from boe_converter.excel_writer import (
     ITEM_TABLE_HEADERS,
     TOTALS_ROW,
     ExcelGenerator,
+    _TEMPLATE_FIRST_DATA_ROW,
+    _TEMPLATE_LAST_DATA_ROW,
+    _shift_coord,
 )
 from boe_converter.models import (
     ExtractedDocument,
@@ -174,16 +177,25 @@ def test_output_structure_and_fixed_labels_match_sample(payload):
             f"expected {label!r} got {cell.value!r}"
         )
 
-    # --- Req 8.2: Totals_Row sits at the sample's fixed position (61) ----
-    # The totals row is always row 61 regardless of item count; at least one
-    # summed column (L = total invoice amount USD) carries the total there.
+    # --- Req 8.2: Totals_Row position (dynamic) -------------------------
+    # The totals row sits at the sample's fixed position (row 61) when the items
+    # fit the template's styled data region; when the line-item count overflows
+    # that region the totals row (and every auxiliary section below it) shift
+    # down by the overflow amount so they never collide with the item rows. At
+    # least one summed column (L = total invoice amount USD) carries the total.
     from boe_converter.excel_writer import COL_AMOUNT
 
     assert TOTALS_ROW == 61
-    assert ws.cell(row=TOTALS_ROW, column=COL_AMOUNT).value == computed.totals.total_amount_usd
+    n_items = len(computed.lines)
+    last_data_row = _TEMPLATE_FIRST_DATA_ROW + n_items - 1
+    shift = max(0, last_data_row - _TEMPLATE_LAST_DATA_ROW)
+    totals_row = TOTALS_ROW + shift
+    assert ws.cell(row=totals_row, column=COL_AMOUNT).value == computed.totals.total_amount_usd
 
-    # --- Req 8.3: auxiliary section labels at their exact cells ---------
+    # --- Req 8.3: auxiliary section labels at their (shifted) cells -----
     for coordinate, label in AUX_LABELS.items():
-        assert ws[coordinate].value == label, (
-            f"aux {coordinate} expected {label!r} got {ws[coordinate].value!r}"
+        shifted = _shift_coord(coordinate, shift)
+        assert ws[shifted].value == label, (
+            f"aux {shifted} (base {coordinate}, shift {shift}) "
+            f"expected {label!r} got {ws[shifted].value!r}"
         )

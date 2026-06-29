@@ -75,7 +75,10 @@ def _decorated_numbers(draw) -> str:
 _blanks = st.sampled_from(["", " ", "   ", "\t", "\n", "  \t \n "])
 
 # Arbitrary non-numeric text (descriptions, wrapped text, codes, unicode).
-_free_text = st.text(min_size=1, max_size=60)
+# Whitespace-only strings are excluded: ``present_values`` represents *present*
+# (non-blank) values, and the parser deliberately classifies a blank/whitespace
+# string as "missing" (raw_text -> None), so such strings belong to ``_blanks``.
+_free_text = st.text(min_size=1, max_size=60).filter(lambda s: s.strip() != "")
 
 # The union used for "present" (non-blank) values. Free text may itself happen
 # to be blank, so the test classifies by ``raw_text.strip()`` rather than by

@@ -41,11 +41,13 @@ map"):
 
 from __future__ import annotations
 
+from copy import copy
 from functools import lru_cache
 from io import BytesIO
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.utils.cell import coordinate_to_tuple, get_column_letter
 from openpyxl.worksheet.worksheet import Worksheet
 
 from boe_converter.models import (
@@ -70,6 +72,10 @@ _TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "ctn_template.x
 _TEMPLATE_FIRST_DATA_ROW = 13
 _TEMPLATE_LAST_DATA_ROW = 60          # styled data region rows 13..60
 _TEMPLATE_TOTALS_ROW = 61
+# A representative interior data row whose per-column styling (borders, number
+# formats, fonts) is cloned onto continuation rows when a document has more
+# line items than the template's styled data region (overflow handling).
+_TEMPLATE_STYLE_ROW = 14
 
 
 @lru_cache(maxsize=1)
@@ -112,8 +118,11 @@ COL_RATE_PER_UNIT = 25            # Y  Ratepurchase per unitPcs/KGS/SET (compute
 ITEM_TABLE_HEADER_ROW = 12
 ITEM_TABLE_FIRST_DATA_ROW = 13
 
-# The Totals_Row sits at the sample's fixed position (row 61), regardless of the
-# actual line-item count, per Req 8.2 (reproduce the sample's cell positions).
+# The Totals_Row's default position (row 61), used when the document fits within
+# the template's styled data region (<=48 items). When a document has more line
+# items than the region, the totals row and the auxiliary sections below it are
+# shifted down by the overflow amount so they never collide with item rows
+# (dynamic positioning); see ``_resolve_layout`` / ``_expand_for_overflow``.
 TOTALS_ROW = 61
 
 # The constant SWS rate written into column V for every line item (sample V=0.1).
@@ -265,6 +274,20 @@ def _sum_optional(values) -> float:
     return total
 
 
+def _shift_coord(coordinate: str, shift: int) -> str:
+    """Return ``coordinate`` with its row shifted down by ``shift`` rows.
+
+    Used to relocate the auxiliary-section labels (and the ``total usd`` value
+    cell) when the line-item count overflows the template's styled data region.
+    A non-positive ``shift`` returns the coordinate unchanged, so documents that
+    fit the template keep the sample's exact cell positions (Req 8.2/8.3).
+    """
+    if shift <= 0:
+        return coordinate
+    row, col = coordinate_to_tuple(coordinate)
+    return f"{get_column_letter(col)}{row + shift}"
+
+
 class ExcelGenerator:
     """Builds the CTN-layout workbook and returns ``.xlsx`` bytes."""
 
@@ -289,29 +312,110 @@ class ExcelGenerator:
         line items and totals into the already-styled cells. The result is
         visually identical to ``1357 ctn llp.xlsx`` while carrying this
         document's data. Exactly one sheet named ``Sheet1`` (Req 8.1).
+
+        When the document has more line items than the template's styled data
+        region (rows 13..60), the totals row and the auxiliary sections below it
+        are shifted down so they never overlap the item rows; the additional
+        item rows inherit the data-row styling (see ``_expand_for_overflow``).
         """
         wb = _load_template()
         ws = wb["Sheet1"]
 
-        self._prepare_template(ws, len(doc.lines))
+        n_items = len(doc.lines)
+        last_data_row = _TEMPLATE_FIRST_DATA_ROW + n_items - 1
+        # Overflow: how far the data extends past the template's styled region.
+        shift = max(0, last_data_row - _TEMPLATE_LAST_DATA_ROW)
+        if shift:
+            self._expand_for_overflow(ws, shift)
+        totals_row = _TEMPLATE_TOTALS_ROW + shift
+
+        self._prepare_template(ws, n_items, totals_row)
         self._write_header_block(ws, doc.header, flags)
         self._write_item_table(ws, doc.lines, flags)
-        self._write_totals_row(ws, doc.totals, doc.lines)
-        self._write_aux_templates(ws)
+        self._write_totals_row(ws, doc.totals, doc.lines, totals_row)
+        self._write_aux_templates(ws, shift, totals_row)
         return wb
+
+    # ------------------------------------------------------------------
+    # Overflow handling (shift totals + aux sections below the item rows)
+    # ------------------------------------------------------------------
+    def _expand_for_overflow(self, ws: Worksheet, shift: int) -> None:
+        """Make room for ``shift`` extra line-item rows below the data region.
+
+        Inserts ``shift`` rows immediately before the template totals row, which
+        pushes the totals row and every auxiliary section below it down by
+        ``shift`` (their values and styles move with them). openpyxl does not
+        relocate merged ranges on insert, so the aux merges (``G71:O71``,
+        ``Q71:X71``, ``G94:O94``) are re-created at their shifted positions. The
+        freshly inserted rows arrive unstyled, so each one is given the data-row
+        styling cloned from a representative template data row, keeping the new
+        item rows visually identical to the originals.
+        """
+        # Capture and release the merges that sit at/below the totals row before
+        # inserting. They must be unmerged while their cells still exist (openpyxl
+        # does not relocate merge coordinates on insert, so unmerging by the old
+        # coordinates afterwards would fail once the cells have shifted).
+        below_specs = [
+            (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
+            for rng in list(ws.merged_cells.ranges)
+            if rng.min_row >= _TEMPLATE_TOTALS_ROW
+        ]
+        for min_row, min_col, max_row, max_col in below_specs:
+            ws.unmerge_cells(
+                start_row=min_row, start_column=min_col,
+                end_row=max_row, end_column=max_col,
+            )
+
+        ws.insert_rows(_TEMPLATE_TOTALS_ROW, shift)
+
+        # Re-create the captured merges at their shifted positions.
+        for min_row, min_col, max_row, max_col in below_specs:
+            ws.merge_cells(
+                start_row=min_row + shift,
+                start_column=min_col,
+                end_row=max_row + shift,
+                end_column=max_col,
+            )
+
+        # Style the newly inserted continuation rows like a real data row.
+        self._clone_data_row_style(
+            ws, _TEMPLATE_TOTALS_ROW, _TEMPLATE_TOTALS_ROW + shift - 1
+        )
+
+    @staticmethod
+    def _clone_data_row_style(ws: Worksheet, first_row: int, last_row: int) -> None:
+        """Copy the data-row styling onto rows ``first_row..last_row`` (inclusive).
+
+        Clones the per-column style (borders, fonts, fills, number formats) and
+        the row height from ``_TEMPLATE_STYLE_ROW`` so overflow item rows render
+        identically to the template's styled data region. Values are left blank;
+        the item writer fills them in afterwards.
+        """
+        ref_height = ws.row_dimensions[_TEMPLATE_STYLE_ROW].height
+        for row in range(first_row, last_row + 1):
+            if ref_height is not None:
+                ws.row_dimensions[row].height = ref_height
+            for col in range(1, COL_RATE_PER_UNIT + 1):
+                src = ws.cell(row=_TEMPLATE_STYLE_ROW, column=col)
+                dst = ws.cell(row=row, column=col)
+                dst._style = copy(src._style)
+                dst.value = None
 
     # ------------------------------------------------------------------
     # Template preparation (clear the sample's data, keep its styling)
     # ------------------------------------------------------------------
-    def _prepare_template(self, ws: Worksheet, n_items: int) -> None:
+    def _prepare_template(self, ws: Worksheet, n_items: int, totals_row: int) -> None:
         """Clear the template's document-specific cells, preserving all styling.
 
         Removes the sample's baked-in header values, line items and totals so
         only this document's data is written, while leaving every style, width,
         height and the auxiliary scaffolding intact. Merged ranges that fall in
         the line-item write region are unmerged so each item keeps its own row.
+        ``totals_row`` is the (possibly shifted) row the totals are written to;
+        the data region and that row are cleared together.
         """
-        write_end = max(_TEMPLATE_LAST_DATA_ROW, _TEMPLATE_FIRST_DATA_ROW + max(n_items, 0) - 1)
+        last_data_row = _TEMPLATE_FIRST_DATA_ROW + max(n_items, 0) - 1
+        write_end = max(_TEMPLATE_LAST_DATA_ROW, last_data_row)
 
         # Unmerge any merged range intersecting the data write region (e.g. the
         # sample's G36:G57) so per-row writes never target a merged cell.
@@ -328,7 +432,7 @@ class ExcelGenerator:
             ws[coord] = None
 
         # Clear the data region and the totals row (cols A..Y), keeping styles.
-        for row in range(_TEMPLATE_FIRST_DATA_ROW, max(write_end, _TEMPLATE_TOTALS_ROW) + 1):
+        for row in range(_TEMPLATE_FIRST_DATA_ROW, max(write_end, totals_row) + 1):
             for col in range(1, COL_RATE_PER_UNIT + 1):
                 ws.cell(row=row, column=col).value = None
 
@@ -460,9 +564,9 @@ class ExcelGenerator:
     # Totals row (row 61)
     # ------------------------------------------------------------------
     def _write_totals_row(
-        self, ws: Worksheet, totals: Totals, lines: list[ComputedLine]
+        self, ws: Worksheet, totals: Totals, lines: list[ComputedLine], totals_row: int
     ) -> None:
-        """Write the Totals_Row at the sample's fixed position (row 61).
+        """Write the Totals_Row at ``totals_row`` (row 61, or shifted on overflow).
 
         Reproduces the sample's summed columns (``G, L, M, N, O, P, Q, S, U, W,
         X``) at full floating-point precision (Req 7.4, 8.2). Columns backed by
@@ -473,7 +577,7 @@ class ExcelGenerator:
         from ``Totals.package_count`` (Req 7.5); if it is missing the cell is
         left blank rather than substituting a value.
         """
-        row = TOTALS_ROW
+        row = totals_row
 
         # G: CTN total = BOE total package count (Req 7.5). Per-line CTN cells are
         # blank in Milestone 1; the total is the extracted package count.
@@ -514,26 +618,29 @@ class ExcelGenerator:
     # ------------------------------------------------------------------
     # Auxiliary template sections (labels only; data cells empty)
     # ------------------------------------------------------------------
-    def _write_aux_templates(self, ws: Worksheet) -> None:
-        """Write the auxiliary section labels verbatim at the sample positions.
+    def _write_aux_templates(self, ws: Worksheet, shift: int, totals_row: int) -> None:
+        """Write the auxiliary section labels verbatim at their (shifted) positions.
 
-        Reproduces, at the sample's exact cell positions and character-for-
-        character (Req 8.3): the ``total usd`` summary (B71 label + E71 value
-        mirroring ``=L61``), the ``DETAILS AS PER CHALLANS`` and ``DETAILS AS PER
-        TALLY`` section titles with their column-header rows, the C&F detail
-        block row labels (B72-B86), and the ``CLEARANCE AND FORWARDING INVOICE``
-        title with its header row. The data cells within these template sections
-        are intentionally left empty (no value) for Milestone 1.
+        Reproduces character-for-character (Req 8.3): the ``total usd`` summary
+        (B71 label + E71 value mirroring ``=L61``), the ``DETAILS AS PER
+        CHALLANS`` and ``DETAILS AS PER TALLY`` section titles with their
+        column-header rows, the C&F detail block row labels (B72-B86), and the
+        ``CLEARANCE AND FORWARDING INVOICE`` title with its header row. When the
+        line-item count overflows the template's data region these positions are
+        shifted down by ``shift`` rows so they sit below the item rows rather
+        than colliding with them; with no overflow (``shift == 0``) they remain
+        at the sample's exact cell positions (Req 8.2). The data cells within
+        these sections are intentionally left empty for Milestone 1.
         """
         for coordinate, label in AUX_LABELS.items():
-            ws[coordinate] = label
+            ws[_shift_coord(coordinate, shift)] = label
 
         # 'total usd' value cell: the sample stores '=L61'; we write the same
         # full-precision total directly so the value is present without relying
-        # on Excel recalculation. The Totals_Row L61 holds the identical value.
-        total_usd = ws.cell(row=TOTALS_ROW, column=COL_AMOUNT).value
+        # on Excel recalculation. The Totals_Row L cell holds the identical value.
+        total_usd = ws.cell(row=totals_row, column=COL_AMOUNT).value
         if total_usd is not None:
-            ws[AUX_TOTAL_USD_CELL] = total_usd
+            ws[_shift_coord(AUX_TOTAL_USD_CELL, shift)] = total_usd
 
     # ------------------------------------------------------------------
     # Small writing helpers

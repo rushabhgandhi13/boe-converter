@@ -32,7 +32,10 @@ MESSAGE_FILE_TOO_LARGE = "File exceeds the 50 MB size limit."
 MESSAGE_INVALID_PDF = "A valid PDF is required."
 MESSAGE_NOT_A_BOE = "The document is not a recognized Bill of Entry."
 
-# BOE marker tokens observed on the reference BOE; all must be present (Req 1.6).
+# BOE marker tokens. A document is recognized when it matches *either* known
+# layout's full marker set (Req 1.6): the new ICEGATE format or the legacy
+# "Indian Customs EDI System" format. Absence of any marker in both sets =>
+# NOT_A_BOE.
 BOE_MARKERS = (
     "BILL OF ENTRY",
     "Port Code",
@@ -40,6 +43,17 @@ BOE_MARKERS = (
     "PART - II",
     "PART - III",
 )
+
+# Legacy "Indian Customs EDI System - Imports V1.5R001" format markers.
+BOE_MARKERS_OLD = (
+    "BILL OF ENTRY",
+    "Indian Customs EDI System",
+    "BE No",
+    "Item Details",
+)
+
+# All recognized marker sets; a match against any one set accepts the document.
+BOE_MARKER_SETS = (BOE_MARKERS, BOE_MARKERS_OLD)
 
 
 @dataclass
@@ -116,23 +130,27 @@ class UploadValidator:
 
     # -- helpers ------------------------------------------------------------
     def _is_recognized_boe(self, handle: Any) -> bool:
-        """True when every BOE marker token is found in the document text.
+        """True when the document matches any known BOE layout's marker set.
 
         Text is scanned page by page with whitespace collapsed and case
         normalized so tokens spanning line breaks or with irregular spacing are
-        still matched. Scanning stops as soon as every marker has been seen.
+        still matched. The markers seen across all pages are accumulated, and the
+        document is recognized as soon as every marker of *any* one set (the new
+        ICEGATE format or the legacy EDI format) has been observed.
         """
-        remaining = {self._normalize(m) for m in BOE_MARKERS}
+        marker_sets = [
+            {self._normalize(m) for m in markers} for markers in BOE_MARKER_SETS
+        ]
         for page in handle.pages:
             try:
                 text = page.extract_text() or ""
             except Exception:
                 continue
             norm = self._normalize(text)
-            remaining = {m for m in remaining if m not in norm}
-            if not remaining:
+            marker_sets = [{m for m in s if m not in norm} for s in marker_sets]
+            if any(not s for s in marker_sets):
                 return True
-        return not remaining
+        return any(not s for s in marker_sets)
 
     @staticmethod
     def _normalize(text: str) -> str:

@@ -30,6 +30,7 @@ _*.py
 # ignored — the app needs it at runtime.
 205090022062026INNSA1BE0230620261842.pdf
 1357 ctn llp.xlsx
+old_format_pdf.pdf
 
 # --- Editor / OS ---
 .vscode/
