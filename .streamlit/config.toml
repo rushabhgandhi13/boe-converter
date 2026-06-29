@@ -1,0 +1,10 @@
+[server]
+# The upload validator rejects files over 50 MB; cap Streamlit's own limit too.
+maxUploadSize = 50
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"

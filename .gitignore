@@ -1,0 +1,38 @@
+# --- Secrets (never commit) ---
+.streamlit/secrets.toml
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Test / tooling caches ---
+.pytest_cache/
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Generated / scratch artifacts ---
+demo_output.xlsx
+convert_resp.json
+_*.py
+
+# --- Real commercial data (test fixtures; not for the public repo) ---
+# The bundled boe_converter/templates/ctn_template.xlsx is intentionally NOT
+# ignored — the app needs it at runtime.
+205090022062026INNSA1BE0230620261842.pdf
+1357 ctn llp.xlsx
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
