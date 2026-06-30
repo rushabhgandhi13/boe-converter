@@ -16,6 +16,7 @@ it only where that is acceptable (e.g. a private/internal Streamlit space).
 from __future__ import annotations
 
 import hmac
+import inspect
 import os
 
 import streamlit as st
@@ -100,10 +101,27 @@ usd_rate = st.number_input(
 if st.button("Convert", type="primary", disabled=uploaded is None):
     raw = uploaded.getvalue()
     invoice_raw = invoice_uploaded.getvalue() if invoice_uploaded is not None else None
-    with st.spinner("Converting…"):
-        result = _orchestrator().convert(
-            raw, uploaded.name, float(usd_rate), invoice_raw=invoice_raw
+    orchestrator = _orchestrator()
+
+    # Resilience against a stale/partial deploy: only pass invoice_raw if the
+    # running orchestrator build actually supports it. This prevents a hard
+    # TypeError crash when Streamlit Cloud has reloaded a newer streamlit_app.py
+    # but an older orchestrator.py (a reboot fully syncs them).
+    supports_invoice = "invoice_raw" in inspect.signature(orchestrator.convert).parameters
+    if invoice_raw is not None and not supports_invoice:
+        st.warning(
+            "The invoice carton feature isn't active on this running app yet. "
+            "Reboot the app (Manage app → Reboot) to enable it; converting the "
+            "Bill of Entry without cartons for now."
         )
+
+    with st.spinner("Converting…"):
+        if supports_invoice:
+            result = orchestrator.convert(
+                raw, uploaded.name, float(usd_rate), invoice_raw=invoice_raw
+            )
+        else:
+            result = orchestrator.convert(raw, uploaded.name, float(usd_rate))
 
     if not result.ok:
         st.error(f"{result.error_code}: {result.message}")
