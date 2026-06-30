@@ -449,6 +449,30 @@ class ExcelGenerator:
             for col in range(1, COL_RATE_PER_UNIT + 1):
                 ws.cell(row=row, column=col).value = None
 
+        # Harmonize the styled data region. The bundled template carries a few
+        # hand-edited rows (58-60) with stray bold / missing-highlight quirks
+        # left over from the original sample; cloning the canonical data row's
+        # per-column style across the whole region makes every item row render
+        # identically (Req 8.x visual fidelity).
+        self._normalize_data_region_style(ws)
+
+    @staticmethod
+    def _normalize_data_region_style(ws: Worksheet) -> None:
+        """Clone the canonical data-row style across rows 13..60.
+
+        Copies the per-column style (fonts, fills, borders, number formats) from
+        ``_TEMPLATE_STYLE_ROW`` onto every row of the template's styled data
+        region so the hand-edited inconsistencies in the sample's last rows
+        (e.g. row 60's stray bold, rows 58-59's missing column-O highlight) do
+        not surface when those rows carry item data. Values are untouched.
+        """
+        for row in range(_TEMPLATE_FIRST_DATA_ROW, _TEMPLATE_LAST_DATA_ROW + 1):
+            if row == _TEMPLATE_STYLE_ROW:
+                continue
+            for col in range(1, COL_RATE_PER_UNIT + 1):
+                src = ws.cell(row=_TEMPLATE_STYLE_ROW, column=col)
+                ws.cell(row=row, column=col)._style = copy(src._style)
+
     # ------------------------------------------------------------------
     # Header block (D1:G8)
     # ------------------------------------------------------------------

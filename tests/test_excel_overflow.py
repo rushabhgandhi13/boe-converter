@@ -167,3 +167,36 @@ def test_boundary_exactly_fills_region():
     assert ws.cell(row=first + n - 1, column=COL_SR_NO).value == n  # row 60
     assert ws.cell(row=TOTALS_ROW, column=COL_SR_NO).value is None  # row 61 clear of items
     assert ws.cell(row=TOTALS_ROW, column=COL_AMOUNT).value > 0
+
+
+def _style_sig(ws, row: int, col: int):
+    """A comparable per-cell style signature (bold, fill colour, borders)."""
+    cell = ws.cell(row=row, column=col)
+    fill = cell.fill.fgColor.rgb if (cell.fill and cell.fill.patternType) else "none"
+    border = "".join(
+        (getattr(cell.border, side).style or "-")[0]
+        for side in ("left", "right", "top", "bottom")
+    )
+    return (bool(cell.font.bold), fill, border, cell.number_format)
+
+
+def test_data_rows_share_uniform_styling():
+    """Every item row (incl. the template's hand-edited rows 58-60 and the
+    overflow continuation rows) matches the canonical data-row styling.
+
+    The bundled template carried stray bold / missing-highlight quirks on rows
+    58-60; the generator normalizes the styled data region so no item row looks
+    different from the others.
+    """
+    n = 80  # fills rows 13..92, exercising rows 58-60 and the overflow rows
+    ws, _ = _build(n)
+    first = ITEM_TABLE_FIRST_DATA_ROW
+    # Canonical reference: an ordinary interior data row.
+    reference = {col: _style_sig(ws, first + 1, col) for col in range(1, 26)}
+
+    for offset in range(n):
+        row = first + offset
+        for col in range(1, 26):
+            assert _style_sig(ws, row, col) == reference[col], (
+                f"row {row} col {col} style differs from the canonical data row"
+            )
