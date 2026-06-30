@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import pdfplumber
 from pdfplumber.utils import extract_words
@@ -104,6 +104,7 @@ class DutyItemRow:
     sws_amount: RawValue        # SWS Amount (Req 3.10 surcharge component)
     igst_rate: RawValue         # IGST Rate, as a decimal fraction (Req 3.11)
     total_duty: RawValue        # 30. TOTAL DUTY (Req 3.12)
+    chcess_amount: RawValue = field(default_factory=RawValue.missing)  # 2.CHCESS (rare)
 
 
 @dataclass(frozen=True)
@@ -430,9 +431,13 @@ class PdfParser:
         party_name = self._extract_party_name(pages_rows)
         container_details = self._extract_container_details(pages_rows)
         bl_no, bl_date = self._extract_bl_no_date(pages_rows)  # where present
+        # Company name (Excel E1) is the BOE's importer name when present,
+        # otherwise the configured fallback.
+        extracted_company = self._extract_company_name(pages_rows)
+        company = extracted_company if extracted_company else company_name
 
         header = HeaderBlock(
-            company_name=company_name,
+            company_name=company,
             party_name=party_name,
             usd_rate=usd_rate,
             details=RawValue.missing(),  # Req 4.6 - out of scope for task 4.4
@@ -665,6 +670,40 @@ class PdfParser:
             return RawValue.missing()
         return self._capture(row[i_pkg + 1].text, numeric=True)
 
+    def _extract_company_name(self, pages_rows) -> str | None:
+        """Importer name for Excel ``Company name`` (E1), from Part I Section B.
+
+        Reads the line directly beneath the ``1.IMPORTER NAME & ADDRESS`` label
+        (the importer's name, e.g. ``PRATIK C SANGHAVI (HUF)``), restricted to
+        the left (importer) column so the adjacent CB/seller column is never
+        mixed in. The conventional ``M/S `` prefix is added when not already
+        present, matching the CTN sheet style. Returns ``None`` when the label
+        cannot be located, so the orchestrator's configured fallback is used.
+        """
+
+        def is_importer(row) -> bool:
+            return any(w.text.lower().startswith("1.importer") for w in row)
+
+        found = self._find_label_row(pages_rows, is_importer)
+        if found is None:
+            return None
+        pi, ri, _row = found
+        rows = pages_rows[pi]
+        if ri + 1 >= len(rows):
+            return None
+        # Importer name sits in the left column; bound it before the right-hand
+        # CB-name column (~x 360) so a right-column token is never appended.
+        name_words = [w for w in rows[ri + 1] if self._center(w) < 360.0]
+        if not name_words:
+            return None
+        name_words.sort(key=lambda w: w.x0)
+        name = " ".join(w.text for w in name_words).strip()
+        if not name:
+            return None
+        if not name.upper().startswith("M/S"):
+            name = f"M/S {name}"
+        return name
+
     def _extract_party_name(self, pages_rows) -> RawValue:
         """Supplier/exporter Party Name (Req 2.7): the first line beneath the
         ``3.SUPPLIER NAME & ADDRESS`` label, taken from the left (supplier)
@@ -789,17 +828,19 @@ class PdfParser:
         bl_no = RawValue.missing()
         bl_date = RawValue.missing()
 
-        # The IGM band carries its values on the single row directly below the
-        # labels, so restrict the read to that row (max_scan=1); scanning further
-        # would let an unrelated label row below supply a false value.
+        # The IGM band carries its values on the row directly below the labels.
+        # The B/L number can WRAP onto the next row (e.g. "NGBCB26011" + "430"),
+        # so gather all number-column tokens across the value row and any
+        # continuation rows, stopping at the next labelled section.
         i_no = self._word_where(row, lambda t: t.lower().startswith(no_prefix))
-        if i_no is not None and i_no + 1 < len(row):
-            anchor = (row[i_no].x0 + row[i_no + 1].x1) / 2.0  # "X.MAWB/HAWB" + "NO"
-            text = self._value_near_anchor(rows, ri, anchor, max_scan=1)
+        i_dt = self._word_where(row, lambda t: t.lower() == date_label)
+        if i_no is not None:
+            x_lo = row[i_no].x0 - 6.0
+            x_hi = (row[i_dt].x0 - 4.0) if i_dt is not None else (row[i_no].x1 + 60.0)
+            text = self._wrapped_value_in_band(rows, ri, x_lo, x_hi)
             if text is not None:
                 bl_no = self._capture(text)
 
-        i_dt = self._word_where(row, lambda t: t.lower() == date_label)
         if i_dt is not None and not bl_no.is_missing:
             anchor = self._center(row[i_dt])
             text = self._value_near_anchor(rows, ri, anchor, max_scan=1)
@@ -807,6 +848,41 @@ class PdfParser:
                 bl_date = self._capture(text)
 
         return bl_no, bl_date
+
+    def _wrapped_value_in_band(
+        self, rows, label_idx: int, x_lo: float, x_hi: float, max_rows: int = 4
+    ) -> str | None:
+        """Concatenate a single value that may wrap across rows in one column.
+
+        Reads the rows below ``label_idx``, collecting alphanumeric tokens whose
+        centre falls in ``[x_lo, x_hi]`` (the column window), and joins them
+        top-to-bottom with no separator (so a number split as ``"NGBCB26011"`` +
+        ``"430"`` is reassembled to ``"NGBCB26011430"``). Stops at the next
+        labelled section (a row whose leftmost token looks like ``"1.BOND"``) or
+        once a row past the value has no token in the window. Date-shaped and
+        dotted (label) tokens are never collected.
+        """
+        parts: list[str] = []
+        for rj in range(label_idx + 1, min(label_idx + 1 + max_rows, len(rows))):
+            current = rows[rj]
+            if not current:
+                continue
+            # Stop before the next labelled section (e.g. "1.BOND NO.").
+            if re.match(r"^\d{1,2}\.", current[0].text):
+                break
+            band = [
+                w
+                for w in current
+                if x_lo <= self._center(w) <= x_hi
+                and re.fullmatch(r"[A-Za-z0-9]+", w.text)
+            ]
+            if not band:
+                if parts:
+                    break  # value ended; following rows belong to other fields
+                continue
+            band.sort(key=lambda w: w.x0)
+            parts.append("".join(w.text for w in band))
+        return "".join(parts) if parts else None
 
     # ------------------------------------------------------------------
     # Line-item extraction (task 5.1)
@@ -1053,6 +1129,7 @@ class PdfParser:
 
         assessable, total_duty = self._duty_assess_total(block)
         bcd_rate, bcd_amount, sws_amount, igst_rate = self._duty_grid(block)
+        chcess_amount = self._chcess_amount(block)
 
         return serial, DutyItemRow(
             item_serial=serial,
@@ -1062,7 +1139,31 @@ class PdfParser:
             sws_amount=sws_amount,
             igst_rate=igst_rate,
             total_duty=total_duty,
+            chcess_amount=chcess_amount,
         )
+
+    def _chcess_amount(self, block) -> RawValue:
+        """Additional customs cess (Part III ``C. OTHER DUTIES`` -> ``2.CHCESS``).
+
+        Present only on some BOEs. Locates the ``OTHER DUTIES`` grid header
+        (carrying ``2.chcess`` and ``5.caidc``), reads the ``Amount`` sub-row in
+        the CHCESS column window, and captures it numerically. Returns missing
+        when the column/grid is absent or the cell is blank (the common case),
+        which the calculator treats as 0.
+        """
+        for bi, row in enumerate(block):
+            low = [w.text.lower() for w in row]
+            if "2.chcess" in low and "5.caidc" in low:
+                ch_x0 = self._x0_of(row, lambda t: t.lower() == "2.chcess")
+                tta_x0 = self._x0_of(row, lambda t: t.lower() == "3.tta")
+                if ch_x0 is None or tta_x0 is None:
+                    return RawValue.missing()
+                amount_row = self._first_row_starting(block, bi + 1, "amount")
+                if amount_row is None:
+                    return RawValue.missing()
+                text = self._token_in_range(amount_row, ch_x0 - 10.0, tta_x0 - 3.0)
+                return self._capture(text, numeric=True)
+        return RawValue.missing()
 
     def _duty_assess_total(self, block) -> tuple[RawValue, RawValue]:
         """Assessable value (29.ASSESS VALUE) and total duty (30. TOTAL DUTY)."""
@@ -1248,6 +1349,9 @@ class PdfParser:
             bcd_amount = duty_row.bcd_amount if duty_row else RawValue.missing()
             igst_rate = duty_row.igst_rate if duty_row else RawValue.missing()
             total_duty = duty_row.total_duty if duty_row else RawValue.missing()
+            chcess_amount = (
+                duty_row.chcess_amount if duty_row else RawValue.missing()
+            )
 
             line_items.append(
                 LineItem(
@@ -1262,6 +1366,7 @@ class PdfParser:
                     bcd_amount=bcd_amount,
                     igst_rate=igst_rate,
                     total_duty=total_duty,
+                    chcess_amount=chcess_amount,
                 )
             )
 

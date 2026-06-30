@@ -121,9 +121,14 @@ def test_container_details_match_reference(header):
 
 
 def test_bl_no_and_date_match_reference(header):
-    """Req 2.9 - Bill of Lading No/Date are extracted where present."""
+    """Req 2.9 - Bill of Lading No/Date are extracted where present.
+
+    The MAWB number wraps onto a second line in the PDF
+    (``NOSNB26NS1`` + ``0105``); the full value must be reassembled rather than
+    truncated to the first line.
+    """
     block, _flags = header
-    assert block.bl_no.raw_text == "NOSNB26NS1"
+    assert block.bl_no.raw_text == "NOSNB26NS10105"
     assert block.bl_no.is_missing is False
     assert block.bl_date.raw_text == "07/06/2026"
     assert block.bl_date.is_missing is False

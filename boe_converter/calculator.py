@@ -151,6 +151,7 @@ class ValueCalculator:
         qty = _as_number(item.quantity)
         assessable = _as_number(item.assessable_value)
         bcd_amount = _as_number(item.bcd_amount)
+        chcess_amount = _as_number(getattr(item, "chcess_amount", None))
         igst_rate = _as_number(item.igst_rate)
         rate = _coerce_number(usd_rate)
 
@@ -171,10 +172,17 @@ class ValueCalculator:
         purchase_inr = (
             amount_usd * rate if amount_usd is not None and rate is not None else None
         )
-        sws_amount = bcd_amount * self.SWS_RATE if bcd_amount is not None else None
+        # CUST AIDC (Excel col U) = BCD amount + additional cess (CHCESS, when
+        # present on the BOE; absent -> 0). SWS and the customs-duty total are
+        # computed on this combined base, matching the BOE (SWS = 10% of BCD +
+        # CHCESS) and the sample workbook.
+        cust_aidc = (
+            bcd_amount + (chcess_amount or 0.0) if bcd_amount is not None else None
+        )
+        sws_amount = cust_aidc * self.SWS_RATE if cust_aidc is not None else None
         total_customs_duty = (
-            bcd_amount + sws_amount
-            if bcd_amount is not None and sws_amount is not None
+            cust_aidc + sws_amount
+            if cust_aidc is not None and sws_amount is not None
             else None
         )
         igst_amount = (
@@ -206,6 +214,7 @@ class ValueCalculator:
             source=item,
             amount_usd=amount_usd,
             purchase_inr=purchase_inr,
+            cust_aidc=cust_aidc,
             sws_amount=sws_amount,
             total_customs_duty=total_customs_duty,
             igst_amount=igst_amount,

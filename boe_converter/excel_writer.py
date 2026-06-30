@@ -584,7 +584,9 @@ class ExcelGenerator:
         self._set_cell(ws, row, COL_CUSTOM_ASS_VALUE, _raw_cell_value(item.assessable_value))
         self._set_cell(ws, row, COL_RATE_OF_DUTY_IGST, _raw_cell_value(item.igst_rate))
         self._set_cell(ws, row, COL_RATE_OF_INTEREST_BCD, _raw_cell_value(item.bcd_rate))
-        self._set_cell(ws, row, COL_CUST_AIDC, _raw_cell_value(item.bcd_amount))
+        # U: CUST AIDC = BCD amount + CHCESS (computed); falls back to the raw
+        # BCD amount when no cess is present (cust_aidc == bcd_amount).
+        self._set_cell(ws, row, COL_CUST_AIDC, line.cust_aidc)
 
         # Constant SWS rate (column V) - sample writes 0.1 on every line.
         ws.cell(row=row, column=COL_RATE_OF_INTEREST_SWS, value=SWS_RATE)
@@ -677,7 +679,7 @@ class ExcelGenerator:
         )
         self._put_total(
             ws, row, COL_CUST_AIDC, "U", first, last,
-            _sum_optional(_raw_number(ln.source.bcd_amount) for ln in lines),
+            _sum_optional(ln.cust_aidc for ln in lines),
         )
         self._put_total(
             ws, row, COL_SURCHARGE, "W", first, last,

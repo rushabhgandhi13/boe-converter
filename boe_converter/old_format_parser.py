@@ -171,9 +171,10 @@ class OldFormatParser:
 
         party_name = self._extract_party_name(pages, page_texts)
         container_details = self._extract_container(full_text)
+        company = self._extract_company_name(pages) or company_name
 
         header = HeaderBlock(
-            company_name=company_name,
+            company_name=company,
             party_name=party_name,
             usd_rate=usd_rate,
             details=RawValue.missing(),
@@ -220,6 +221,58 @@ class OldFormatParser:
                             return self._cap._capture(dm.group(1))
                         return RawValue.missing()
         return RawValue.missing()
+
+    def _extract_company_name(self, pages) -> str | None:
+        """Importer name for Excel ``Company name`` (E1) in the legacy format.
+
+        The importer name sits on the line directly beneath the ``Importer
+        Details`` line, in the left column (e.g. ``PRATIK C SANGHAVI (HUF)``).
+        The conventional ``M/S `` prefix is added when not already present.
+        Returns ``None`` when it cannot be located so the configured fallback is
+        used.
+        """
+        if not pages:
+            return None
+        try:
+            words = pages[0].extract_words()
+        except Exception:
+            return None
+        if not words:
+            return None
+        # Group words into rows by their vertical position.
+        words = sorted(words, key=lambda w: (round(float(w["top"]), 1), float(w["x0"])))
+        rows: list[list[dict]] = []
+        cur: list[dict] = []
+        cur_top: float | None = None
+        for w in words:
+            top = float(w["top"])
+            if cur_top is None or abs(top - cur_top) <= 3.0:
+                cur.append(w)
+                cur_top = top if cur_top is None else (cur_top + top) / 2.0
+            else:
+                rows.append(cur)
+                cur = [w]
+                cur_top = top
+        if cur:
+            rows.append(cur)
+
+        for ri, row in enumerate(rows):
+            texts = [w["text"].lower() for w in row]
+            if "importer" in texts and "details" in texts and ri + 1 < len(rows):
+                name_words = [
+                    w for w in rows[ri + 1]
+                    if (float(w["x0"]) + float(w["x1"])) / 2.0 < 300.0
+                ]
+                if not name_words:
+                    return None
+                name_words.sort(key=lambda w: float(w["x0"]))
+                name = " ".join(w["text"] for w in name_words).strip()
+                if not name:
+                    return None
+                if not name.upper().startswith("M/S"):
+                    name = f"M/S {name}"
+                return name
+        return None
 
     def _extract_party_name(self, pages, page_texts) -> RawValue:
         """Supplier/party name printed in the right column of the invoice row.

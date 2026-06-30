@@ -79,6 +79,10 @@ class LineItem:
     bcd_amount: RawValue          # Req 3.10
     igst_rate: RawValue           # Req 3.11
     total_duty: RawValue          # Req 3.12
+    # Additional customs cess (Part III "2.CHCESS"); present only on some BOEs.
+    # When present it is added to the BCD amount to form the customs-duty base
+    # (CUST AIDC, Excel column U); defaults to missing (treated as 0).
+    chcess_amount: RawValue = field(default_factory=RawValue.missing)
     # Per-line carton (CTN) count for Excel column G. Not present in the BOE
     # itself; optionally supplied from the supplier invoice and joined on
     # ``item_serial`` (defaults to missing -> the CTN cell stays blank).
@@ -111,8 +115,9 @@ class ComputedLine:
     source: LineItem
     amount_usd: float | None = None              # Req 6.1  = unit_price_usd * qty
     purchase_inr: float | None = None            # Req 6.2  = amount_usd * usd_rate
-    sws_amount: float | None = None              # Req 6.3  = bcd_amount * 0.10
-    total_customs_duty: float | None = None      # Req 6.4  = bcd_amount + sws_amount
+    cust_aidc: float | None = None               # Excel col U = bcd_amount + chcess_amount
+    sws_amount: float | None = None              # Req 6.3  = cust_aidc * 0.10
+    total_customs_duty: float | None = None      # Req 6.4  = cust_aidc + sws_amount
     igst_amount: float | None = None             # Req 6.5  = igst_rate * (assess + total_customs_duty)
     combined_duty: float | None = None           # Req 6.6  = total_customs_duty + igst_amount
     land_cost_excl_gst: float | None = None      # Req 6.7  = purchase_inr + total_customs_duty
