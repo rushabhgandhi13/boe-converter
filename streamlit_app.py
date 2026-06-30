@@ -83,6 +83,15 @@ def _orchestrator() -> ConversionOrchestrator:
 
 
 uploaded = st.file_uploader("Bill of Entry PDF", type=["pdf"])
+invoice_uploaded = st.file_uploader(
+    "Invoice / Packing List PDF (optional)",
+    type=["pdf"],
+    help=(
+        "Optional. If provided, per-line carton counts (CTN, column G) are read "
+        "from the invoice's TOTAL CTNS column and matched to the BOE line items "
+        "by serial number. Leave empty to keep the CTN column blank."
+    ),
+)
 usd_rate = st.number_input(
     "USD rate", min_value=0.0, value=95.30, step=0.01, format="%.2f",
     help="The USD→INR conversion rate applied to every line item.",
@@ -90,8 +99,11 @@ usd_rate = st.number_input(
 
 if st.button("Convert", type="primary", disabled=uploaded is None):
     raw = uploaded.getvalue()
+    invoice_raw = invoice_uploaded.getvalue() if invoice_uploaded is not None else None
     with st.spinner("Converting…"):
-        result = _orchestrator().convert(raw, uploaded.name, float(usd_rate))
+        result = _orchestrator().convert(
+            raw, uploaded.name, float(usd_rate), invoice_raw=invoice_raw
+        )
 
     if not result.ok:
         st.error(f"{result.error_code}: {result.message}")

@@ -575,6 +575,9 @@ class ExcelGenerator:
         # Direct (verbatim) values.
         self._set_cell(ws, row, COL_DESCRIPTION, _raw_cell_value(item.description))
         self._set_cell(ws, row, COL_HSN_CODE, _raw_cell_value(item.cth_hsn))
+        # G: per-line CTN - populated from the supplier invoice when supplied,
+        # otherwise blank (the BOE itself has no per-line carton count).
+        self._set_cell(ws, row, COL_CTN, _raw_cell_value(item.cartons))
         self._set_cell(ws, row, COL_QTY, _raw_cell_value(item.quantity))
         self._set_cell(ws, row, COL_UNIT, _raw_cell_value(item.unit))
         self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))

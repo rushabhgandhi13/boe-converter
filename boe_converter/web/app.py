@@ -107,8 +107,13 @@ def create_app() -> FastAPI:
         # NOTE (Milestone 1): unauthenticated endpoint -- local tool only.
         file: UploadFile = File(...),
         usd_rate: str = Form(...),
+        invoice: UploadFile | None = File(None),
     ):
         """Convert one uploaded BOE PDF into the CTN workbook.
+
+        An optional ``invoice`` PDF (the supplier invoice / packing list) may be
+        supplied; when present its per-line carton counts are read and matched
+        to the BOE line items by serial to populate the CTN column.
 
         Returns ``{ download_token, summary }`` on success, or the mapped
         ``{ error_code, message }`` body on rejection/failure.
@@ -124,7 +129,11 @@ def create_app() -> FastAPI:
         raw = await file.read()
         filename = file.filename or "upload.pdf"
 
-        result = orchestrator.convert(raw, filename, rate)
+        invoice_raw: bytes | None = None
+        if invoice is not None and invoice.filename:
+            invoice_raw = await invoice.read()
+
+        result = orchestrator.convert(raw, filename, rate, invoice_raw=invoice_raw)
 
         if not result.ok:
             return _error_response(
@@ -212,6 +221,9 @@ _UPLOAD_PAGE_HTML = """<!DOCTYPE html>
     <label for="usd_rate">USD Rate (INR per USD)</label>
     <input type="number" id="usd_rate" name="usd_rate" step="any" min="0" required />
 
+    <label for="invoice">Invoice / Packing List PDF (optional)</label>
+    <input type="file" id="invoice" name="invoice" accept="application/pdf" />
+
     <div>
       <button type="submit" id="submit-btn">Convert</button>
     </div>
@@ -239,6 +251,8 @@ _UPLOAD_PAGE_HTML = """<!DOCTYPE html>
       const fd = new FormData();
       fd.append('file', document.getElementById('file').files[0]);
       fd.append('usd_rate', document.getElementById('usd_rate').value);
+      const invoiceFile = document.getElementById('invoice').files[0];
+      if (invoiceFile) { fd.append('invoice', invoiceFile); }
 
       try {
         const resp = await fetch('/api/convert', { method: 'POST', body: fd });

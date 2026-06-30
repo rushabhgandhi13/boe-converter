@@ -39,10 +39,11 @@ from __future__ import annotations
 import logging
 import secrets
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from boe_converter.calculator import ValueCalculator
 from boe_converter.excel_writer import ExcelGenerator
+from boe_converter.invoice_parser import InvoicePackingListParser
 from boe_converter.models import (
     ComputedDocument,
     ConversionSummary,
@@ -147,11 +148,13 @@ class ConversionOrchestrator:
         calculator: ValueCalculator | None = None,
         generator: ExcelGenerator | None = None,
         time_budget_seconds: float | None = None,
+        invoice_parser: InvoicePackingListParser | None = None,
     ) -> None:
         self.validator = validator or UploadValidator()
         self.parser = parser or PdfParser()
         self.calculator = calculator or ValueCalculator()
         self.generator = generator or ExcelGenerator()
+        self.invoice_parser = invoice_parser or InvoicePackingListParser()
         # The post-recognition time budget (Req 1.3 default 60s). It is made
         # configurable so a slower deployment (e.g. a shared-CPU Streamlit host
         # converting a large multi-hundred-page BOE) can allow more time rather
@@ -168,6 +171,7 @@ class ConversionOrchestrator:
         raw: bytes,
         filename: str,
         usd_rate: float,
+        invoice_raw: bytes | None = None,
     ) -> ConversionResult:
         """Run the full pipeline and return a :class:`ConversionResult`.
 
@@ -199,6 +203,10 @@ class ConversionOrchestrator:
         handle = outcome.handle
         try:
             extracted = self.parser.parse(handle, usd_rate=usd_rate)
+            # Optional: attach per-line carton counts from the supplier invoice.
+            # Non-fatal - a missing/unreadable invoice simply leaves CTN blank.
+            if invoice_raw:
+                extracted = self._attach_cartons(extracted, invoice_raw)
             computed = self.calculator.compute(extracted, usd_rate)
             workbook_bytes = self.generator.generate(
                 computed, ReviewFlagSet(computed.flags)
@@ -239,6 +247,40 @@ class ConversionOrchestrator:
         return ConversionResult.succeeded(
             token, summary, output_complete=output_complete
         )
+
+    # ------------------------------------------------------------------
+    # Optional invoice carton enrichment
+    # ------------------------------------------------------------------
+    def _attach_cartons(
+        self, extracted: ExtractedDocument, invoice_raw: bytes
+    ) -> ExtractedDocument:
+        """Attach per-line carton counts from the supplier invoice (by serial).
+
+        Parses the invoice's ``TOTAL CTNS`` column and rebuilds each
+        ``LineItem`` whose serial appears in the invoice with its carton count
+        set (Excel column ``G``). Lines absent from the invoice keep a blank
+        carton cell. Any failure (unreadable invoice, unexpected layout) is
+        swallowed and logged - the BOE conversion proceeds without cartons so an
+        optional, malformed invoice never fails the whole conversion.
+        """
+        try:
+            import io
+
+            cartons = self.invoice_parser.parse_cartons(io.BytesIO(invoice_raw))
+        except Exception:
+            logger.exception("Invoice carton extraction failed; proceeding without CTN")
+            return extracted
+
+        if not cartons:
+            return extracted
+
+        new_items = [
+            replace(item, cartons=cartons[item.item_serial])
+            if item.item_serial in cartons
+            else item
+            for item in extracted.line_items
+        ]
+        return replace(extracted, line_items=new_items)
 
     # ------------------------------------------------------------------
     # Download token store

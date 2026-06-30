@@ -79,6 +79,10 @@ class LineItem:
     bcd_amount: RawValue          # Req 3.10
     igst_rate: RawValue           # Req 3.11
     total_duty: RawValue          # Req 3.12
+    # Per-line carton (CTN) count for Excel column G. Not present in the BOE
+    # itself; optionally supplied from the supplier invoice and joined on
+    # ``item_serial`` (defaults to missing -> the CTN cell stays blank).
+    cartons: RawValue = field(default_factory=RawValue.missing)
 
 
 @dataclass(frozen=True)
