@@ -582,8 +582,11 @@ class ExcelGenerator:
         self._set_cell(ws, row, COL_UNIT, _raw_cell_value(item.unit))
         self._set_cell(ws, row, COL_UNIT_PRICE_USD, _raw_cell_value(item.unit_price_usd))
         self._set_cell(ws, row, COL_CUSTOM_ASS_VALUE, _raw_cell_value(item.assessable_value))
-        self._set_cell(ws, row, COL_RATE_OF_DUTY_IGST, _raw_cell_value(item.igst_rate))
-        self._set_cell(ws, row, COL_RATE_OF_INTEREST_BCD, _raw_cell_value(item.bcd_rate))
+        # Direct (verbatim) rate values. BOE rates are stored as fractions
+        # (e.g. 0.075 for 7.5%). The template's whole-percent format rounds
+        # fractional rates, so R/T get an explicit value-aware percent format.
+        self._set_rate_cell(ws, row, COL_RATE_OF_DUTY_IGST, _raw_cell_value(item.igst_rate))
+        self._set_rate_cell(ws, row, COL_RATE_OF_INTEREST_BCD, _raw_cell_value(item.bcd_rate))
         # U: CUST AIDC = BCD amount + CHCESS (computed); falls back to the raw
         # BCD amount when no cess is present (cust_aidc == bcd_amount).
         self._set_cell(ws, row, COL_CUST_AIDC, line.cust_aidc)
@@ -787,6 +790,20 @@ class ExcelGenerator:
         """
         if value is not None:
             ws.cell(row=row, column=col, value=value)
+
+    @staticmethod
+    def _set_rate_cell(ws: Worksheet, row: int, col: int, value: object | None) -> None:
+        """Write a direct rate value with whole/fractional percent display.
+
+        Whole percentages use ``0%`` so 18% renders without a dangling decimal
+        point. Fractional percentages use ``0.##%`` so 7.5% is not rounded to 8%.
+        """
+        if value is None:
+            return
+        cell = ws.cell(row=row, column=col, value=value)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            percent = float(value) * 100
+            cell.number_format = "0%" if abs(percent - round(percent)) < 1e-9 else "0.##%"
 
     @staticmethod
     def _set_if_value(ws: Worksheet, coordinate: str, value: object | None) -> None:

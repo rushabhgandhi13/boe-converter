@@ -29,6 +29,8 @@ from boe_converter.excel_writer import (
     COL_LAND_COST_WITH_GST,
     COL_LAND_COST_WITHOUT_GST,
     COL_PCS,
+    COL_RATE_OF_DUTY_IGST,
+    COL_RATE_OF_INTEREST_BCD,
     COL_RATE_PER_UNIT,
     COL_RATE_PER_USD,
     COL_SURCHARGE,
@@ -73,7 +75,16 @@ def _header(usd_rate: float = 95.3) -> HeaderBlock:
     )
 
 
-def _item(serial: int, *, unit: str = "DOZ", qty=10, price=2, missing_price=False) -> LineItem:
+def _item(
+    serial: int,
+    *,
+    unit: str = "DOZ",
+    qty=10,
+    price=2,
+    missing_price=False,
+    bcd_rate=0.10,
+    igst_rate=0.18,
+) -> LineItem:
     return LineItem(
         item_serial=serial,
         cth_hsn=_str("12345678"),
@@ -82,9 +93,9 @@ def _item(serial: int, *, unit: str = "DOZ", qty=10, price=2, missing_price=Fals
         quantity=_num(qty),
         unit=_str(unit),
         assessable_value=_num(1000),
-        bcd_rate=_num(0.10),
+        bcd_rate=_num(bcd_rate),
         bcd_amount=_num(100),
-        igst_rate=_num(0.18),
+        igst_rate=_num(igst_rate),
         total_duty=_num(50),
     )
 
@@ -122,6 +133,18 @@ def test_igst_column_q_is_literal_not_formula():
     q = ws.cell(row=13, column=COL_GST).value
     assert not (isinstance(q, str) and q.startswith("="))
     assert q == computed.lines[0].igst_amount
+
+
+def test_rate_cells_format_whole_and_fractional_percentages():
+    """R/T keep exact values while avoiding rounded or dangling-percent display."""
+    ws, _ = _build([_item(1, bcd_rate=0.075, igst_rate=0.18)])
+
+    igst = ws.cell(row=13, column=COL_RATE_OF_DUTY_IGST)
+    bcd = ws.cell(row=13, column=COL_RATE_OF_INTEREST_BCD)
+    assert igst.value == 0.18
+    assert bcd.value == 0.075
+    assert igst.number_format == "0%"
+    assert bcd.number_format == "0.##%"
 
 
 def test_usd_rate_integer_renders_without_trailing_zero():
