@@ -36,6 +36,7 @@ Design references: design.md "Conversion Orchestrator", "Error Handling"
 
 from __future__ import annotations
 
+import logging
 import secrets
 import time
 from dataclasses import dataclass, field
@@ -53,6 +54,8 @@ from boe_converter.models import (
 )
 from boe_converter.parser import PdfParser
 from boe_converter.validator import UploadValidator
+
+logger = logging.getLogger(__name__)
 
 # Error code/message for a post-recognition failure (Req 1.7). Rejection
 # error codes/messages come from the validator (Req 1.2/1.5/1.6).
@@ -143,11 +146,19 @@ class ConversionOrchestrator:
         parser: PdfParser | None = None,
         calculator: ValueCalculator | None = None,
         generator: ExcelGenerator | None = None,
+        time_budget_seconds: float | None = None,
     ) -> None:
         self.validator = validator or UploadValidator()
         self.parser = parser or PdfParser()
         self.calculator = calculator or ValueCalculator()
         self.generator = generator or ExcelGenerator()
+        # The post-recognition time budget (Req 1.3 default 60s). It is made
+        # configurable so a slower deployment (e.g. a shared-CPU Streamlit host
+        # converting a large multi-hundred-page BOE) can allow more time rather
+        # than failing a conversion that would otherwise succeed.
+        self.time_budget_seconds = (
+            self.TIME_BUDGET_SECONDS if time_budget_seconds is None else time_budget_seconds
+        )
         # In-memory token -> workbook bytes store. A token is only added here
         # after a fully successful build, guaranteeing atomic output (Req 1.7).
         self._downloads: dict[str, bytes] = {}
@@ -193,15 +204,26 @@ class ConversionOrchestrator:
                 computed, ReviewFlagSet(computed.flags)
             )
         except Exception:
+            # The document was recognized as a BOE, so this is a
+            # post-recognition failure (Req 1.7): report a generic failure with
+            # no token. Log the real cause so it is diagnosable from the server
+            # / Streamlit logs (the user-facing message stays generic).
+            logger.exception("Conversion failed after BOE recognition (file=%s)", filename)
             return ConversionResult.rejected(
                 ERROR_CONVERSION_FAILED, MESSAGE_CONVERSION_FAILED
             )
         finally:
             self._safe_close(handle)
 
-        # 3) 60-second budget (Req 1.3). Overrun => post-recognition failure
-        #    (Req 1.7); the in-memory workbook is discarded, no token issued.
-        if time.monotonic() - start > self.TIME_BUDGET_SECONDS:
+        # 3) Time budget (Req 1.3, configurable). Overrun => post-recognition
+        #    failure (Req 1.7); the in-memory workbook is discarded, no token.
+        elapsed = time.monotonic() - start
+        if elapsed > self.time_budget_seconds:
+            logger.warning(
+                "Conversion exceeded the %.0fs budget (took %.1fs, file=%s); "
+                "consider raising time_budget_seconds for this deployment.",
+                self.time_budget_seconds, elapsed, filename,
+            )
             return ConversionResult.rejected(
                 ERROR_CONVERSION_FAILED, MESSAGE_CONVERSION_FAILED
             )

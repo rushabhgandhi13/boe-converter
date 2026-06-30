@@ -16,6 +16,7 @@ it only where that is acceptable (e.g. a private/internal Streamlit space).
 from __future__ import annotations
 
 import hmac
+import os
 
 import streamlit as st
 
@@ -69,8 +70,16 @@ st.caption(
 
 @st.cache_resource
 def _orchestrator() -> ConversionOrchestrator:
-    """A single shared orchestrator (holds the in-memory download store)."""
-    return ConversionOrchestrator()
+    """A single shared orchestrator (holds the in-memory download store).
+
+    Streamlit Community Cloud runs on a slow shared CPU, so a large
+    multi-hundred-page Bill of Entry can take well over the default 60-second
+    budget to parse. The budget is raised here (overridable via the
+    ``BOE_TIME_BUDGET_SECONDS`` env var / app secret) so those conversions
+    complete instead of failing with a generic CONVERSION_FAILED.
+    """
+    budget = float(os.environ.get("BOE_TIME_BUDGET_SECONDS", "600"))
+    return ConversionOrchestrator(time_budget_seconds=budget)
 
 
 uploaded = st.file_uploader("Bill of Entry PDF", type=["pdf"])
