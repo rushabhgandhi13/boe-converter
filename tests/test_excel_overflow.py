@@ -92,7 +92,7 @@ def _build(n_items: int):
         lines=calc_lines,
         totals=Totals(total_amount_usd=float(n_items)),
     )
-    wb = ExcelGenerator().build_workbook(doc, ReviewFlagSet())
+    wb = ExcelGenerator(use_formulas=False).build_workbook(doc, ReviewFlagSet())
     return wb["Sheet1"], doc
 
 

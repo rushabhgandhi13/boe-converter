@@ -167,10 +167,12 @@ def test_end_to_end_convert_and_download_within_budget(reference_pdf_bytes):
         # The row immediately after the last data row is blank (dense block).
         assert ws.cell(row=LAST_DATA_ROW + 1, column=1).value is None
 
-        # Totals row at row 61 with the Amount (column L) total populated.
+        # Totals row at row 61. The downloaded workbook carries a live SUM
+        # formula over the data rows (matching the sample workbook's
+        # ``=SUM(L13:L59)`` style), so the cell holds the formula text.
         amount_total = ws.cell(row=TOTALS_ROW, column=COL_L_AMOUNT).value
-        assert isinstance(amount_total, (int, float))
-        assert amount_total > 0
+        assert isinstance(amount_total, str)
+        assert amount_total.startswith(f"=SUM(L{FIRST_DATA_ROW}:L")
     finally:
         wb.close()
 
@@ -190,11 +192,21 @@ def test_generated_totals_match_golden_workbook(reference_pdf_bytes):
     duty/derived columns are intentionally skipped (see module docstring) because
     the sample stores manually-keyed duty figures the parser recomputes.
     """
-    # Generate the workbook through the orchestrator (full pipeline).
-    orchestrator = ConversionOrchestrator()
-    result = orchestrator.convert(reference_pdf_bytes, "boe.pdf", USD_RATE)
-    assert result.ok, "the reference BOE must convert successfully"
-    generated_bytes = orchestrator.get_download(result.download_token)
+    # Generate the workbook in literal (evaluated) mode so the totals carry
+    # numbers comparable to the golden workbook's cached values. The downloaded
+    # workbook from the orchestrator carries live SUM formulas instead (verified
+    # in test_end_to_end_convert_and_download_within_budget and
+    # tests/test_excel_formulas.py); openpyxl does not evaluate formulas, so a
+    # literal build is used here for the numeric golden comparison. The pipeline
+    # correctness (parse -> compute -> generate) is still exercised end to end.
+    from boe_converter.calculator import ValueCalculator
+    from boe_converter.excel_writer import ExcelGenerator
+    from boe_converter.models import ReviewFlagSet
+    from boe_converter.parser import PdfParser
+
+    extracted = PdfParser().parse(io.BytesIO(reference_pdf_bytes), usd_rate=USD_RATE)
+    computed = ValueCalculator().compute(extracted, USD_RATE)
+    generated_bytes = ExcelGenerator(use_formulas=False).generate(computed, ReviewFlagSet())
     assert generated_bytes is not None
 
     gen_wb = openpyxl.load_workbook(io.BytesIO(generated_bytes))

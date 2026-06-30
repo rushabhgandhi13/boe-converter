@@ -159,7 +159,10 @@ def test_output_structure_and_fixed_labels_match_sample(payload):
 
     doc, usd_rate = payload
     computed = ValueCalculator().compute(doc, usd_rate)
-    wb = ExcelGenerator().build_workbook(computed, ReviewFlagSet())
+    # Literal mode so the totals cell carries the evaluated amount (the live
+    # formula form is asserted in tests/test_excel_formulas.py); structure and
+    # label positions are identical in both modes.
+    wb = ExcelGenerator(use_formulas=False).build_workbook(computed, ReviewFlagSet())
 
     # --- Req 8.1: exactly one worksheet, named "Sheet1" -----------------
     assert wb.sheetnames == ["Sheet1"]

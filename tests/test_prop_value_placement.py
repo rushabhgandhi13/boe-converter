@@ -179,7 +179,9 @@ def test_values_placed_in_mapped_cells_at_full_precision(payload):
 
     doc, usd_rate = payload
     computed = ValueCalculator().compute(doc, usd_rate)
-    ws = ExcelGenerator().build_workbook(computed, ReviewFlagSet()).active
+    # Literal mode: assert the evaluated computed values land in their mapped
+    # cells. The live-formula output is covered by tests/test_excel_formulas.py.
+    ws = ExcelGenerator(use_formulas=False).build_workbook(computed, ReviewFlagSet()).active
 
     # --- Header_Block (D1:G8) -------------------------------------------
     header = computed.header

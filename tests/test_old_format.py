@@ -210,7 +210,8 @@ def test_old_format_end_to_end_conversion():
         assert ws.cell(row=13, column=1).value == 1
         assert ws.cell(row=last_data_row, column=1).value == 122
         assert ws.cell(row=totals_row, column=7).value == 908  # total CTN/pkgs
+        # The downloaded workbook carries a live SUM formula for the amount total.
         amount_total = ws.cell(row=totals_row, column=12).value
-        assert isinstance(amount_total, (int, float)) and amount_total > 0
+        assert isinstance(amount_total, str) and amount_total.startswith("=SUM(L13:")
     finally:
         wb.close()

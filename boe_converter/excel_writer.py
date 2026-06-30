@@ -291,6 +291,19 @@ def _shift_coord(coordinate: str, shift: int) -> str:
 class ExcelGenerator:
     """Builds the CTN-layout workbook and returns ``.xlsx`` bytes."""
 
+    def __init__(self, use_formulas: bool = True) -> None:
+        """Create a generator.
+
+        ``use_formulas`` (default ``True``) makes the computed cells carry live
+        Excel formulas mirroring the sample workbook (e.g. ``L=H*K``,
+        ``M=L*<usd_rate>``, ``=SUM(...)`` totals) rather than pre-evaluated
+        literal values, so the downloaded workbook recalculates in Excel exactly
+        like ``1357 ctn llp.xlsx``. Set it to ``False`` to emit full-precision
+        literal values instead (used by tests that read the evaluated numbers
+        back without an Excel engine to recalculate them).
+        """
+        self.use_formulas = use_formulas
+
     def generate(self, doc: ComputedDocument, flags: ReviewFlagSet) -> bytes:
         """Build ``Sheet1`` in the exact CTN layout and return ``.xlsx`` bytes.
 
@@ -331,7 +344,7 @@ class ExcelGenerator:
 
         self._prepare_template(ws, n_items, totals_row)
         self._write_header_block(ws, doc.header, flags)
-        self._write_item_table(ws, doc.lines, flags)
+        self._write_item_table(ws, doc.lines, doc.header.usd_rate, flags)
         self._write_totals_row(ws, doc.totals, doc.lines, totals_row)
         self._write_aux_templates(ws, shift, totals_row)
         return wb
@@ -489,7 +502,7 @@ class ExcelGenerator:
     # Item table (header row 12, data from row 13)
     # ------------------------------------------------------------------
     def _write_item_table(
-        self, ws: Worksheet, lines: list[ComputedLine], flags: ReviewFlagSet
+        self, ws: Worksheet, lines: list[ComputedLine], usd_rate: float, flags: ReviewFlagSet
     ) -> None:
         """Write the Item_Table header (row 12) and the dense data rows (Req 5.x).
 
@@ -512,7 +525,7 @@ class ExcelGenerator:
         ordered = sorted(lines, key=lambda ln: ln.source.item_serial)
         for offset, line in enumerate(ordered):
             row = ITEM_TABLE_FIRST_DATA_ROW + offset
-            self._write_item_row(ws, row, offset + 1, line, flags)
+            self._write_item_row(ws, row, offset + 1, line, usd_rate, flags)
 
     def _write_item_row(
         self,
@@ -520,6 +533,7 @@ class ExcelGenerator:
         row: int,
         sr_no: int,
         line: ComputedLine,
+        usd_rate: float,
         flags: ReviewFlagSet,
     ) -> None:
         """Write one Line_Item's cells into ``row`` per the column map.
@@ -548,17 +562,42 @@ class ExcelGenerator:
         # Constant SWS rate (column V) - sample writes 0.1 on every line.
         ws.cell(row=row, column=COL_RATE_OF_INTEREST_SWS, value=SWS_RATE)
 
-        # Computed (full-precision) values; None leaves the cell blank (Req 6.13).
-        self._set_cell(ws, row, COL_PCS, line.pcs)
-        self._set_cell(ws, row, COL_AMOUNT, line.amount_usd)
-        self._set_cell(ws, row, COL_RATE_PER_USD, line.purchase_inr)
-        self._set_cell(ws, row, COL_LAND_COST_WITHOUT_GST, line.land_cost_excl_gst)
-        self._set_cell(ws, row, COL_TOTAL_CUSTOM_DUTY, line.total_customs_duty)
+        # GST/IGST amount (column Q) is a literal in the sample (manually keyed),
+        # so it is always written as a value and is referenced by the S and X
+        # formulas below.
         self._set_cell(ws, row, COL_GST, line.igst_amount)
-        self._set_cell(ws, row, COL_TOTAL_CUSTOM_DUTY_2, line.combined_duty)
-        self._set_cell(ws, row, COL_SURCHARGE, line.sws_amount)
-        self._set_cell(ws, row, COL_LAND_COST_WITH_GST, line.land_cost_incl_gst)
-        self._set_cell(ws, row, COL_RATE_PER_UNIT, line.purchase_rate_per_unit)
+
+        # Computed (full-precision) values. When formula mode is on these carry
+        # the sample's live Excel formulas (referencing the literal cells H, K,
+        # U, V, Q on the same row); otherwise the pre-evaluated literal is
+        # written. A ``None`` computed value (missing/non-numeric input, Req
+        # 6.13) leaves the cell blank in both modes so the formula never turns a
+        # missing input into a spurious 0.
+        qty = _raw_number(item.quantity)
+        self._put_computed(ws, row, COL_PCS, line.pcs, f"=H{row}*12")
+        self._put_computed(ws, row, COL_AMOUNT, line.amount_usd, f"=H{row}*K{row}")
+        self._put_computed(
+            ws, row, COL_RATE_PER_USD, line.purchase_inr, f"=L{row}*{self._num(usd_rate)}"
+        )
+        self._put_computed(ws, row, COL_SURCHARGE, line.sws_amount, f"=U{row}*V{row}")
+        self._put_computed(
+            ws, row, COL_TOTAL_CUSTOM_DUTY, line.total_customs_duty, f"=U{row}+W{row}"
+        )
+        self._put_computed(
+            ws, row, COL_LAND_COST_WITHOUT_GST, line.land_cost_excl_gst, f"=M{row}+P{row}"
+        )
+        self._put_computed(
+            ws, row, COL_TOTAL_CUSTOM_DUTY_2, line.combined_duty, f"=P{row}+Q{row}"
+        )
+        self._put_computed(
+            ws, row, COL_LAND_COST_WITH_GST, line.land_cost_incl_gst, f"=M{row}+S{row}"
+        )
+        # Y = O/H; guard the qty==0 case (calculator yields 0) so the formula
+        # never produces a #DIV/0! error in the workbook.
+        if line.purchase_rate_per_unit is not None and self.use_formulas and qty not in (None, 0):
+            ws.cell(row=row, column=COL_RATE_PER_UNIT, value=f"=O{row}/H{row}")
+        else:
+            self._set_cell(ws, row, COL_RATE_PER_UNIT, line.purchase_rate_per_unit)
 
     # ------------------------------------------------------------------
     # Totals row (row 61)
@@ -578,42 +617,49 @@ class ExcelGenerator:
         left blank rather than substituting a value.
         """
         row = totals_row
+        n = len(lines)
+        first = ITEM_TABLE_FIRST_DATA_ROW
+        last = first + n - 1  # inclusive last data row; < first when no items
 
         # G: CTN total = BOE total package count (Req 7.5). Per-line CTN cells are
-        # blank in Milestone 1; the total is the extracted package count.
+        # blank in Milestone 1; the total is the extracted package count and is
+        # always written as a literal (never a SUM of the empty per-line column).
         self._set_cell(ws, row, COL_CTN, _raw_cell_value(totals.package_count))
 
-        # L: total invoice Amount (USD) (Req 7.1).
-        self._set_cell(ws, row, COL_AMOUNT, totals.total_amount_usd)
-        # M: total Rate Per USD in purchase (sum of per-line purchase_inr).
-        self._set_cell(
-            ws, row, COL_RATE_PER_USD, _sum_optional(ln.purchase_inr for ln in lines)
+        # The remaining summed columns mirror the sample's ``=SUM(<col>13:<col>N)``
+        # formulas in formula mode, or the pre-evaluated literal otherwise.
+        self._put_total(ws, row, COL_AMOUNT, "L", first, last, totals.total_amount_usd)
+        self._put_total(
+            ws, row, COL_RATE_PER_USD, "M", first, last,
+            _sum_optional(ln.purchase_inr for ln in lines),
         )
-        # N: total CUSTOM ASS VALUE (Req 7.2).
-        self._set_cell(ws, row, COL_CUSTOM_ASS_VALUE, totals.total_assessable_value)
-        # O: total LAND COST WITHOUT GST (Req 7.2).
-        self._set_cell(
-            ws, row, COL_LAND_COST_WITHOUT_GST, totals.total_land_cost_excl_gst
+        self._put_total(
+            ws, row, COL_CUSTOM_ASS_VALUE, "N", first, last, totals.total_assessable_value
         )
-        # P: total TOTAL Custom Duty (Req 7.2).
-        self._set_cell(ws, row, COL_TOTAL_CUSTOM_DUTY, totals.total_customs_duty)
-        # Q: total GST/IGST (Req 7.2).
-        self._set_cell(ws, row, COL_GST, totals.total_igst)
-        # S: total 'total custom duty' (sum of per-line combined_duty).
-        self._set_cell(
-            ws, row, COL_TOTAL_CUSTOM_DUTY_2, _sum_optional(ln.combined_duty for ln in lines)
+        self._put_total(
+            ws, row, COL_LAND_COST_WITHOUT_GST, "O", first, last,
+            totals.total_land_cost_excl_gst,
         )
-        # U: total CUST AIDC (sum of per-line BCD amount, as written in column U).
-        self._set_cell(
-            ws,
-            row,
-            COL_CUST_AIDC,
+        self._put_total(
+            ws, row, COL_TOTAL_CUSTOM_DUTY, "P", first, last, totals.total_customs_duty
+        )
+        self._put_total(ws, row, COL_GST, "Q", first, last, totals.total_igst)
+        self._put_total(
+            ws, row, COL_TOTAL_CUSTOM_DUTY_2, "S", first, last,
+            _sum_optional(ln.combined_duty for ln in lines),
+        )
+        self._put_total(
+            ws, row, COL_CUST_AIDC, "U", first, last,
             _sum_optional(_raw_number(ln.source.bcd_amount) for ln in lines),
         )
-        # W: total SURCHARGE (sum of per-line sws_amount).
-        self._set_cell(ws, row, COL_SURCHARGE, _sum_optional(ln.sws_amount for ln in lines))
-        # X: total LAND COST WITH GST (Req 7.2).
-        self._set_cell(ws, row, COL_LAND_COST_WITH_GST, totals.total_land_cost_incl_gst)
+        self._put_total(
+            ws, row, COL_SURCHARGE, "W", first, last,
+            _sum_optional(ln.sws_amount for ln in lines),
+        )
+        self._put_total(
+            ws, row, COL_LAND_COST_WITH_GST, "X", first, last,
+            totals.total_land_cost_incl_gst,
+        )
 
     # ------------------------------------------------------------------
     # Auxiliary template sections (labels only; data cells empty)
@@ -635,16 +681,74 @@ class ExcelGenerator:
         for coordinate, label in AUX_LABELS.items():
             ws[_shift_coord(coordinate, shift)] = label
 
-        # 'total usd' value cell: the sample stores '=L61'; we write the same
-        # full-precision total directly so the value is present without relying
-        # on Excel recalculation. The Totals_Row L cell holds the identical value.
-        total_usd = ws.cell(row=totals_row, column=COL_AMOUNT).value
-        if total_usd is not None:
-            ws[_shift_coord(AUX_TOTAL_USD_CELL, shift)] = total_usd
+        # 'total usd' value cell: the sample stores '=L61'; mirror that with a
+        # live formula in formula mode, or the evaluated literal otherwise. The
+        # Totals_Row L cell holds the identical value/formula.
+        target = _shift_coord(AUX_TOTAL_USD_CELL, shift)
+        if self.use_formulas:
+            ws[target] = f"=L{totals_row}"
+        else:
+            total_usd = ws.cell(row=totals_row, column=COL_AMOUNT).value
+            if total_usd is not None:
+                ws[target] = total_usd
 
     # ------------------------------------------------------------------
     # Small writing helpers
     # ------------------------------------------------------------------
+    def _put_computed(
+        self, ws: Worksheet, row: int, col: int, value: object | None, formula: str
+    ) -> None:
+        """Write a computed cell as a formula or literal, blank when ``None``.
+
+        In formula mode the live Excel ``formula`` is written (mirroring the
+        sample workbook); otherwise the pre-evaluated ``value`` literal is
+        written. A ``None`` value (missing/non-numeric input, Req 6.13) leaves
+        the cell blank in both modes, so a formula is never written for a cell
+        whose inputs were absent (which would otherwise read blanks as 0).
+        """
+        if value is None:
+            return
+        if self.use_formulas:
+            ws.cell(row=row, column=col, value=formula)
+        else:
+            ws.cell(row=row, column=col, value=value)
+
+    def _put_total(
+        self,
+        ws: Worksheet,
+        row: int,
+        col: int,
+        col_letter: str,
+        first: int,
+        last: int,
+        value: object | None,
+    ) -> None:
+        """Write a Totals_Row cell as ``=SUM(<col>first:<col>last)`` or a literal.
+
+        In formula mode a ``SUM`` over the actual data rows is written (matching
+        the sample's ``=SUM(L13:L59)`` style); with no data rows
+        (``last < first``) or in literal mode the pre-evaluated ``value`` is
+        written instead.
+        """
+        if self.use_formulas and last >= first:
+            ws.cell(row=row, column=col, value=f"=SUM({col_letter}{first}:{col_letter}{last})")
+        else:
+            self._set_cell(ws, row, col, value)
+
+    @staticmethod
+    def _num(value: float) -> str:
+        """Render a numeric literal for embedding in a formula (no exponent).
+
+        Integers render without a trailing ``.0`` (e.g. ``95`` not ``95.0``) and
+        finite floats render in plain decimal form so the formula text matches
+        the sample's style (``=L13*95.3``).
+        """
+        if value is None:
+            return "0"
+        if isinstance(value, float) and value.is_integer():
+            return str(int(value))
+        return repr(value)
+
     @staticmethod
     def _set_cell(ws: Worksheet, row: int, col: int, value: object | None) -> None:
         """Write ``value`` at ``(row, col)`` only when it is not ``None``.
