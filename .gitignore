@@ -34,6 +34,12 @@ old_format_pdf.pdf
 INV&PKG_LIST.pdf
 PRATIK C SANGHAVI (HUF) 1071 CTN BE.pdf
 1071 CTN.xlsx
+# Tally-JSON feature sample data
+908_bill_entry.pdf
+908 (1).xlsx
+Master.json
+Purchase_2022823.json
+AccountingVouchers.xlsx
 
 # --- Editor / OS ---
 .vscode/
