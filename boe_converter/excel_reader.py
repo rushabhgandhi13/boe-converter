@@ -208,3 +208,41 @@ def _totals_from_lines(lines: list[ComputedLine]) -> Totals:
         total_igst=sum(l.igst_amount or 0.0 for l in lines),
         total_land_cost_excl_gst=sum(l.land_cost_excl_gst or 0.0 for l in lines),
     )
+
+
+def write_tally_names(raw: bytes, names: dict[int, str]) -> bytes:
+    """Fill the ``AS PER TALLY NAME`` column (D) of a generated CTN workbook.
+
+    ``names`` maps a line's serial number (column ``A``) to the canonical Tally
+    stock-item name to write in column ``D`` of that row. Rows whose serial is
+    not in ``names`` are left untouched. Returns the edited workbook bytes.
+
+    This lets Step 2 (name mapping) round-trip the *same* perfectly-formatted
+    workbook produced by Step 1 - only column D is edited, nothing else changes.
+    """
+    wb = load_workbook(io.BytesIO(raw))
+    ws = wb.active
+    row = ITEM_TABLE_FIRST_DATA_ROW
+    blank_streak = 0
+    while row < 5000:
+        sr = ws.cell(row=row, column=COL_SR_NO).value
+        desc = ws.cell(row=row, column=COL_DESCRIPTION).value
+        if not _is_serial(sr) and not (isinstance(desc, str) and desc.strip()):
+            blank_streak += 1
+            if blank_streak >= 3:
+                break
+            row += 1
+            continue
+        blank_streak = 0
+        if _is_serial(sr):
+            try:
+                serial = int(sr)
+            except (TypeError, ValueError):
+                serial = None
+            if serial is not None and serial in names and names[serial].strip():
+                ws.cell(row=row, column=COL_AS_PER_TALLY_NAME).value = names[serial].strip()
+        row += 1
+
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()

@@ -46,6 +46,30 @@ _DATE_RE = re.compile(
     r"\d{1,2}[-/][A-Za-z]{3,9}[-/]\d{2,4}|\d{1,2}/\d{1,2}/\d{2,4}"
 )
 
+# A 15-character Indian GSTIN as printed on the BOE (e.g. ``27AAYFG7003K1ZW``).
+# The first two digits are the state code. Used to read the importer's (buyer's)
+# GSTIN so the Tally voucher carries it FROM THE BOE rather than a default.
+_GSTIN_RE = re.compile(r"\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]")
+
+# A 6-digit Indian PIN code (importer address).
+_PIN_RE = re.compile(r"\b\d{6}\b")
+
+# GSTIN state-code -> state name (first two digits of a GSTIN). Only the common
+# codes are mapped; an unmapped code yields a missing state rather than a guess.
+_GSTIN_STATE = {
+    "01": "Jammu and Kashmir", "02": "Himachal Pradesh", "03": "Punjab",
+    "04": "Chandigarh", "05": "Uttarakhand", "06": "Haryana", "07": "Delhi",
+    "08": "Rajasthan", "09": "Uttar Pradesh", "10": "Bihar", "11": "Sikkim",
+    "12": "Arunachal Pradesh", "13": "Nagaland", "14": "Manipur", "15": "Mizoram",
+    "16": "Tripura", "17": "Meghalaya", "18": "Assam", "19": "West Bengal",
+    "20": "Jharkhand", "21": "Odisha", "22": "Chhattisgarh", "23": "Madhya Pradesh",
+    "24": "Gujarat", "26": "Dadra and Nagar Haveli and Daman and Diu",
+    "27": "Maharashtra", "28": "Andhra Pradesh", "29": "Karnataka", "30": "Goa",
+    "31": "Lakshadweep", "32": "Kerala", "33": "Tamil Nadu", "34": "Puducherry",
+    "35": "Andaman and Nicobar Islands", "36": "Telangana", "37": "Andhra Pradesh",
+    "38": "Ladakh",
+}
+
 
 @dataclass(frozen=True)
 class Word:
@@ -436,6 +460,14 @@ class PdfParser:
         extracted_company = self._extract_company_name(pages_rows)
         company = extracted_company if extracted_company else company_name
 
+        # Buyer (importer) and seller (supplier) identity, read FROM THE BOE so
+        # the Tally voucher is populated from the document rather than defaults.
+        buyer_gstin = self._extract_buyer_gstin(pages_rows)
+        buyer_address, buyer_pincode, buyer_state = self._extract_buyer_details(
+            pages_rows
+        )
+        seller_address, seller_country = self._extract_seller_details(pages_rows)
+
         header = HeaderBlock(
             company_name=company,
             party_name=party_name,
@@ -451,6 +483,12 @@ class PdfParser:
             invoice_currency=invoice_currency,
             package_count=package_count,
             container_details=container_details,
+            buyer_gstin=buyer_gstin,
+            buyer_address=buyer_address,
+            buyer_pincode=buyer_pincode,
+            buyer_state=buyer_state,
+            seller_address=seller_address,
+            seller_country=seller_country,
         )
 
         # Required header fields (Req 2.1-2.8). B/L (2.9) is "where present" and
@@ -703,6 +741,120 @@ class PdfParser:
         if not name.upper().startswith("M/S"):
             name = f"M/S {name}"
         return name
+
+    # ------------------------------------------------------------------
+    # Buyer (importer) / seller (supplier) identity blocks
+    # ------------------------------------------------------------------
+    def _block_lines(
+        self, pages_rows, label_prefix: str, x_split: float = 320.0, max_rows: int = 8
+    ) -> list[str]:
+        """Left-column text lines printed beneath a ``N.LABEL`` heading.
+
+        Collects the rows below the row that starts with ``label_prefix`` (e.g.
+        ``"1.importer"``), keeping only words left of ``x_split`` (so the adjacent
+        right-hand column - CB name / Third Party - is never mixed in), and stops
+        at the next numbered section label. The heading row itself is excluded.
+        """
+        found = self._find_label_row(
+            pages_rows, lambda row: any(w.text.lower().startswith(label_prefix) for w in row)
+        )
+        if found is None:
+            return []
+        pi, ri, _row = found
+        rows = pages_rows[pi]
+        lines: list[str] = []
+        for rj in range(ri + 1, min(ri + 1 + max_rows, len(rows))):
+            words = [w for w in rows[rj] if self._center(w) < x_split]
+            if not words:
+                continue
+            words.sort(key=lambda w: w.x0)
+            text = " ".join(w.text for w in words).strip()
+            if not text:
+                continue
+            # Stop at the next numbered section (e.g. "5.AEO", "1.INV VALUE")
+            # or the "AD CODE" line that trails the importer block.
+            if re.match(r"^\d+\.[A-Za-z]", text) or text.upper().startswith("AD CODE"):
+                break
+            lines.append(text)
+        return lines
+
+    def _extract_buyer_gstin(self, pages_rows) -> RawValue:
+        """The importer's (buyer's) 15-char GSTIN, read from the header band.
+
+        The BOE prints ``GSTIN/TYPE 27AAYFG7003K1ZW/G`` in the top band; the
+        first GSTIN-shaped token found is the importer's. Returns missing when no
+        GSTIN is present (a foreign/unregistered importer)."""
+        for rows in pages_rows:
+            for row in rows:
+                for w in row:
+                    m = _GSTIN_RE.search(w.text)
+                    if m:
+                        return self._capture(m.group(0))
+        return RawValue.missing()
+
+    def _extract_buyer_details(
+        self, pages_rows
+    ) -> tuple[RawValue, RawValue, RawValue]:
+        """(address, pincode, state) for the importer/buyer.
+
+        Address is the importer block's lines after the name, joined with commas.
+        Pincode is the first 6-digit token in that block. State is derived from
+        the buyer GSTIN's leading state code (never guessed from the address)."""
+        lines = self._block_lines(pages_rows, "1.importer")
+        addr_lines = lines[1:] if len(lines) > 1 else []
+
+        pincode = RawValue.missing()
+        for text in addr_lines:
+            m = _PIN_RE.search(text)
+            if m:
+                pincode = self._capture(m.group(0), numeric=True)
+                break
+
+        # Address without the standalone pincode line (kept in its own field).
+        addr_clean = [t for t in addr_lines if not _PIN_RE.fullmatch(t.strip())]
+        address = self._capture(", ".join(addr_clean)) if addr_clean else RawValue.missing()
+
+        state = RawValue.missing()
+        gstin = self._extract_buyer_gstin(pages_rows)
+        if not gstin.is_missing and isinstance(gstin.raw_text, str):
+            code = gstin.raw_text[:2]
+            if code in _GSTIN_STATE:
+                state = self._capture(_GSTIN_STATE[code])
+        return address, pincode, state
+
+    def _extract_seller_details(self, pages_rows) -> tuple[RawValue, RawValue]:
+        """(address, country) for the supplier/seller from the supplier block.
+
+        Address is the supplier block's lines after the name, joined with commas.
+        Country is taken from the trailing all-caps place token (e.g. ``CHINA``)
+        when present; otherwise missing."""
+        lines = self._block_lines(pages_rows, "3.supplier")
+        addr_lines = lines[1:] if len(lines) > 1 else []
+        if not addr_lines:
+            return RawValue.missing(), RawValue.missing()
+
+        country = RawValue.missing()
+        # The last line is usually the country in caps (e.g. "CHINA"); otherwise
+        # scan the final address line for a trailing all-caps word.
+        for text in reversed(addr_lines):
+            token = text.strip().strip(".,").strip()
+            if re.fullmatch(r"[A-Z][A-Z ]{2,}", token):
+                country = self._capture(token.title())
+                break
+            m = re.search(r"([A-Z]{3,})\s*$", text.strip())
+            if m:
+                country = self._capture(m.group(1).title())
+                break
+
+        # Drop a trailing line that is just the country (avoids "..., CHINA, CHINA").
+        if (
+            not country.is_missing
+            and addr_lines
+            and addr_lines[-1].strip().strip(".,").strip().title() == country.raw_text
+        ):
+            addr_lines = addr_lines[:-1]
+        address = self._capture(", ".join(addr_lines)) if addr_lines else RawValue.missing()
+        return address, country
 
     def _extract_party_name(self, pages_rows) -> RawValue:
         """Supplier/exporter Party Name (Req 2.7): the first line beneath the

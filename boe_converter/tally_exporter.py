@@ -7,6 +7,14 @@ rate** into purchase ledgers, each carrying its stock items as
 ``inventoryallocations`` plus the matching ``IGST Purchase``/``IGST Payable``
 ledgers, a ``Custom Duty Payable`` ledger and the supplier *party* ledger.
 
+Buyer (importer) and seller (supplier) identity are populated **from the BOE**
+(the ``HeaderBlock`` buyer_*/seller_* fields the parser now extracts), with an
+optional :class:`CompanyProfile` / :class:`SellerProfile` override for any field
+the user wants to correct from stored data. No Tally master file is consulted:
+ledger names follow Tally's own deterministic conventions
+(``Factory Purchase (Import 5%)``, ``IGST Purchase @ 5.00 %``,
+``IGST Payable @ 5%``, ``Custom Duty Payable``, ``Tax Free (Purchases)``).
+
 Accounting model (reverse-engineered from the reference voucher and expressed
 purely in terms of computed per-line fields):
 
@@ -22,18 +30,17 @@ purely in terms of computed per-line fields):
 The identity ``sum(land_cost_excl_gst) == sum(purchase_inr) + sum(total_customs_duty)``
 keeps the voucher balanced.
 
-Names are never invented: every ledger name is resolved through
-:class:`~boe_converter.tally_master.TallyMaster` so the master's canonical
-spelling is used. Only pure Tally structural constants live here.
+Unit conversion: quantities printed in dozens/gross/thousand are converted to
+pieces on the inventory allocation (DOZ x12, GRS x144, THD x1000) so Tally
+receives PCS. The line amount is preserved; only qty/unit/rate change.
 """
 
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, replace
 
-from boe_converter.models import ComputedDocument, ComputedLine
-from boe_converter.tally_master import TallyMaster
+from boe_converter.models import ComputedDocument, ComputedLine, HeaderBlock, RawValue
 
 # ---------------------------------------------------------------------------
 # Pure Tally structural constants (never printed on a BOE)
@@ -46,22 +53,35 @@ DEFAULT_ENTERED_BY = "boe-converter"
 CUSTOM_DUTY_LEDGER = "Custom Duty Payable"
 TAX_FREE_LEDGER = "Tax Free (Purchases)"
 
+# Unit conversion factors to pieces (PCS). A unit not listed is left unchanged.
+_UNIT_TO_PCS = {"DOZ": 12.0, "GRS": 144.0, "THD": 1000.0}
+
 
 @dataclass(frozen=True)
 class CompanyProfile:
     """Buyer/company identity - the Tally company the voucher is imported into.
 
-    These are company-level settings (not per-BOE data). Defaults are placeholders;
-    callers should supply the real company's values (typically confirmed once in
-    the UI). GSTIN/state drive Tally's tax context.
+    Every field defaults to ``None`` meaning "use the value extracted from the
+    BOE". Supply a value only to override the BOE (e.g. from stored data). This
+    is how the buyer is populated *from the document* while still allowing a
+    manual correction.
     """
 
-    name: str = "Gemini Unicom LLP"
-    gstin: str = ""
-    state: str = "Maharashtra"
-    pincode: str = ""
+    name: str | None = None
+    gstin: str | None = None
+    state: str | None = None
+    pincode: str | None = None
+    address_lines: tuple[str, ...] | None = None
     entered_by: str = DEFAULT_ENTERED_BY
-    address_lines: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class SellerProfile:
+    """Supplier/seller identity override (defaults to the BOE-extracted values)."""
+
+    name: str | None = None
+    address_lines: tuple[str, ...] | None = None
+    country: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -97,6 +117,37 @@ def _guid() -> str:
     return f"{uuid.uuid4()}-{uuid.uuid4().hex[:8]}"
 
 
+def _convert_to_pcs(qty: float, unit: str) -> tuple[float, str]:
+    """Convert a (qty, unit) to pieces when the unit is DOZ/GRS/THD.
+
+    Returns ``(converted_qty, converted_unit)``; unchanged for other units.
+    """
+    factor = _UNIT_TO_PCS.get(unit.upper().strip()) if unit else None
+    if factor:
+        return qty * factor, "PCS"
+    return qty, unit
+
+
+# ---------------------------------------------------------------------------
+# Ledger-name conventions (deterministic; no master file needed)
+# ---------------------------------------------------------------------------
+def _purchase_ledger_name(rate_fraction: float) -> str:
+    return f"Factory Purchase (Import {_pct_label(rate_fraction)}%)"
+
+
+def _igst_purchase_ledger_name(rate_fraction: float) -> str:
+    return f"IGST Purchase @ {_pct(rate_fraction):.2f} %"
+
+
+def _igst_payable_ledger_name(rate_fraction: float) -> str:
+    return f"IGST Payable @ {_pct_label(rate_fraction)}%"
+
+
+def _party_ledger_name(supplier: str) -> str:
+    """Tally party ledger name: title-cased supplier name (matches reference)."""
+    return supplier.title()
+
+
 # ---------------------------------------------------------------------------
 # Value extraction helpers
 # ---------------------------------------------------------------------------
@@ -123,6 +174,13 @@ def _text(rv) -> str | None:
     return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
 
+def _split_address(text: str | None) -> list[str]:
+    """Split a comma-joined address into individual lines (empty when absent)."""
+    if not text:
+        return []
+    return [part.strip() for part in text.split(",") if part.strip()]
+
+
 def _line_igst_fraction(line: ComputedLine) -> float:
     """The IGST rate fraction for a line (0.0 when missing/unreadable)."""
     r = _num(line.source.igst_rate)
@@ -142,33 +200,33 @@ def _stock_name(line: ComputedLine) -> str:
 # Exporter
 # ---------------------------------------------------------------------------
 class TallyExporter:
-    """Builds a Purchase voucher ``tallymessage`` document."""
+    """Builds a Purchase voucher ``tallymessage`` document.
 
-    def __init__(self, master: TallyMaster, company: CompanyProfile | None = None) -> None:
-        self.master = master
+    Buyer/seller identity comes from the BOE ``HeaderBlock`` by default; pass a
+    :class:`CompanyProfile` / :class:`SellerProfile` to override individual
+    fields (e.g. from stored data).
+    """
+
+    def __init__(
+        self,
+        company: CompanyProfile | None = None,
+        seller: SellerProfile | None = None,
+    ) -> None:
         self.company = company or CompanyProfile()
+        self.seller = seller or SellerProfile()
 
     # -- public API ---------------------------------------------------------
     def required_ledger_names(self, computed: ComputedDocument) -> list[str]:
-        """Every ledger name this voucher will reference, canonicalised.
-
-        Used by the UI to check the master and prompt for missing entries
-        *before* generating the JSON.
-        """
-        names: list[str] = []
-        party = self._party_name(computed)
-        names.append(self.master.resolve(party))
-
-        rates = _distinct_rates(computed)
-        for r in rates:
+        """Every ledger name this voucher will reference (for UI display)."""
+        names: list[str] = [self._party_name(computed)]
+        for r in _distinct_rates(computed):
             if r <= 0:
-                names.append(self.master.resolve(TAX_FREE_LEDGER))
+                names.append(TAX_FREE_LEDGER)
                 continue
-            names.append(self.master.match_rate_ledger("Factory Purchase Import", r).name)
-            names.append(self.master.match_rate_ledger("IGST Purchase", r).name)
-            names.append(self.master.match_rate_ledger("IGST Payable", r).name)
-        names.append(self.master.resolve(CUSTOM_DUTY_LEDGER))
-        # De-duplicate preserving order.
+            names.append(_purchase_ledger_name(r))
+            names.append(_igst_purchase_ledger_name(r))
+            names.append(_igst_payable_ledger_name(r))
+        names.append(CUSTOM_DUTY_LEDGER)
         seen: set[str] = set()
         out: list[str] = []
         for n in names:
@@ -179,8 +237,7 @@ class TallyExporter:
 
     def build(self, computed: ComputedDocument, usd_rate: float) -> dict:
         """Build the full Tally import document for ``computed``."""
-        party_name = self._party_name(computed)
-        party_ledger = self.master.resolve(party_name)
+        party_ledger = self._party_ledger(computed)
         cost_centre = _text(computed.header.details) or ""
         usd_total = computed.totals.total_amount_usd
         party_total = sum(l.purchase_inr or 0.0 for l in computed.lines)
@@ -190,21 +247,15 @@ class TallyExporter:
 
         ledger_entries: list[dict] = []
         # 1) Party (supplier) ledger - credit, carries the bill reference.
-        ledger_entries.append(
-            self._party_entry(party_ledger, party_total, computed)
-        )
+        ledger_entries.append(self._party_entry(party_ledger, party_total, computed))
 
         # 2) Purchase + IGST ledgers, grouped by IGST rate.
         for rate in _distinct_rates(computed):
             group = [l for l in computed.lines if _same_rate(_line_igst_fraction(l), rate)]
             if rate <= 0:
-                ledger_entries.append(
-                    self._tax_free_entry(group, cost_centre)
-                )
+                ledger_entries.append(self._tax_free_entry(group, cost_centre))
                 continue
-            ledger_entries.append(
-                self._purchase_entry(rate, group, cost_centre)
-            )
+            ledger_entries.append(self._purchase_entry(rate, group, cost_centre))
             igst_sum = sum(l.igst_amount or 0.0 for l in group)
             if abs(igst_sum) > 0:
                 ledger_entries.append(self._igst_purchase_entry(rate, igst_sum, cost_centre))
@@ -212,16 +263,52 @@ class TallyExporter:
 
         # 3) Custom Duty Payable - credit.
         ledger_entries.append(
-            self._simple_credit(self.master.resolve(CUSTOM_DUTY_LEDGER), duty_total, cost_centre=None)
+            self._simple_credit(CUSTOM_DUTY_LEDGER, duty_total, cost_centre=None)
         )
 
         voucher = self._voucher_shell(computed, party_ledger, narration, cost_centre)
         voucher["allledgerentries"] = ledger_entries
         return {"tallymessage": [voucher]}
 
+    # -- buyer / seller resolution -----------------------------------------
+    def _buyer_name(self, computed: ComputedDocument) -> str:
+        if self.company.name:
+            return self.company.name
+        name = computed.header.company_name or ""
+        # The BOE importer name carries an "M/S " prefix for the Excel sheet;
+        # strip it for the Tally buyer so it matches the company master.
+        if name[:4].upper() == "M/S ":
+            name = name[4:].strip()
+        return name
+
+    def _buyer_gstin(self, computed: ComputedDocument) -> str:
+        return self.company.gstin or _text(computed.header.buyer_gstin) or ""
+
+    def _buyer_state(self, computed: ComputedDocument) -> str:
+        return self.company.state or _text(computed.header.buyer_state) or ""
+
+    def _buyer_pincode(self, computed: ComputedDocument) -> str:
+        return self.company.pincode or _text(computed.header.buyer_pincode) or ""
+
+    def _buyer_address_lines(self, computed: ComputedDocument) -> list[str]:
+        if self.company.address_lines is not None:
+            return list(self.company.address_lines)
+        return _split_address(_text(computed.header.buyer_address))
+
+    def _seller_address_lines(self, computed: ComputedDocument) -> list[str]:
+        if self.seller.address_lines is not None:
+            return list(self.seller.address_lines)
+        return _split_address(_text(computed.header.seller_address))
+
+    def _seller_country(self, computed: ComputedDocument) -> str:
+        return self.seller.country or _text(computed.header.seller_country) or ""
+
     # -- party --------------------------------------------------------------
     def _party_name(self, computed: ComputedDocument) -> str:
-        return _text(computed.header.party_name) or "Unknown Supplier"
+        return self.seller.name or _text(computed.header.party_name) or "Unknown Supplier"
+
+    def _party_ledger(self, computed: ComputedDocument) -> str:
+        return _party_ledger_name(self._party_name(computed))
 
     def _party_entry(self, ledger: str, total: float, computed: ComputedDocument) -> dict:
         bill_ref = _text(computed.header.invoice_no) or _text(computed.header.be_no) or "Ref"
@@ -247,7 +334,7 @@ class TallyExporter:
 
     # -- purchase (taxable, grouped) ---------------------------------------
     def _purchase_entry(self, rate: float, group: list[ComputedLine], cost_centre: str) -> dict:
-        ledger = self.master.match_rate_ledger("Factory Purchase Import", rate).name
+        ledger = _purchase_ledger_name(rate)
         total = sum(l.land_cost_excl_gst or 0.0 for l in group)
         return {
             "oldauditentryids": [{"metadata": True, "type": "Number"}, "-1"],
@@ -273,10 +360,12 @@ class TallyExporter:
     def _inventory(self, line: ComputedLine, rate: float, cost_centre: str) -> dict:
         name = _stock_name(line)
         hsn = _text(line.source.cth_hsn) or ""
-        unit = _text(line.source.unit) or "NOS"
-        qty = _num(line.source.quantity) or 0.0
+        raw_unit = _text(line.source.unit) or "NOS"
+        raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        unit_rate = line.purchase_rate_per_unit or (amount / qty if qty else 0.0)
+        # Convert dozens/gross/thousand to pieces; keep the amount, adjust rate.
+        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        unit_rate = (amount / qty) if qty else 0.0
         pct = _pct(rate)
         half = round(pct / 2, 2)
         alloc = {
@@ -334,7 +423,7 @@ class TallyExporter:
 
     # -- tax free (zero-rated) ---------------------------------------------
     def _tax_free_entry(self, group: list[ComputedLine], cost_centre: str) -> dict:
-        ledger = self.master.resolve(TAX_FREE_LEDGER)
+        ledger = TAX_FREE_LEDGER
         total = sum(l.land_cost_excl_gst or 0.0 for l in group)
         return {
             "oldauditentryids": [{"metadata": True, "type": "Number"}, "-1"],
@@ -361,10 +450,11 @@ class TallyExporter:
     def _inventory_nil(self, line: ComputedLine, cost_centre: str) -> dict:
         name = _stock_name(line)
         hsn = _text(line.source.cth_hsn) or ""
-        unit = _text(line.source.unit) or "NOS"
-        qty = _num(line.source.quantity) or 0.0
+        raw_unit = _text(line.source.unit) or "NOS"
+        raw_qty = _num(line.source.quantity) or 0.0
         amount = line.land_cost_excl_gst or 0.0
-        unit_rate = line.purchase_rate_per_unit or (amount / qty if qty else 0.0)
+        qty, unit = _convert_to_pcs(raw_qty, raw_unit)
+        unit_rate = (amount / qty) if qty else 0.0
         return {
             "stockitemname": name,
             "gstovrdntaxability": "Nil Rated",
@@ -402,11 +492,11 @@ class TallyExporter:
 
     # -- IGST purchase / payable -------------------------------------------
     def _igst_purchase_entry(self, rate: float, igst: float, cost_centre: str) -> dict:
-        ledger = self.master.match_rate_ledger("IGST Purchase", rate).name
+        ledger = _igst_purchase_ledger_name(rate)
         return self._tax_entry(ledger, -igst, deemed_positive=True, cost_centre=cost_centre)
 
     def _igst_payable_entry(self, rate: float, igst: float, cost_centre: str) -> dict:
-        ledger = self.master.match_rate_ledger("IGST Payable", rate).name
+        ledger = _igst_payable_ledger_name(rate)
         return self._tax_entry(ledger, igst, deemed_positive=False, cost_centre=cost_centre)
 
     def _tax_entry(self, ledger: str, amount: float, deemed_positive: bool, cost_centre: str) -> dict:
@@ -451,6 +541,10 @@ class TallyExporter:
         base = cost_centre or ""
         return f"{base} USD {usd_total:.2f} @{_fmt_num(usd_rate)}".strip()
 
+    def _string_block(self, lines: list[str]) -> list:
+        """A Tally multi-line string block: ``[{metadata..}, line, line, ...]``."""
+        return [{"metadata": True, "type": "String"}, *lines]
+
     def _voucher_shell(
         self,
         computed: ComputedDocument,
@@ -461,7 +555,15 @@ class TallyExporter:
         date = _tally_date(_text(computed.header.be_date))
         guid = _guid()
         party_name = self._party_name(computed)
-        return {
+        buyer_name = self._buyer_name(computed)
+        buyer_gstin = self._buyer_gstin(computed)
+        buyer_state = self._buyer_state(computed)
+        buyer_pincode = self._buyer_pincode(computed)
+        buyer_addr = self._buyer_address_lines(computed)
+        seller_addr = self._seller_address_lines(computed)
+        seller_country = self._seller_country(computed)
+
+        shell = {
             "metadata": {
                 "type": "Voucher",
                 "guid": guid,
@@ -476,19 +578,21 @@ class TallyExporter:
             "vatdealertype": "Regular",
             "narration": narration,
             "enteredby": self.company.entered_by,
+            "countryofresidence": seller_country or "India",
             "vouchertypename": "Purchase",
             "partyname": party_name,
             "partyledgername": party_ledger,
             "partymailingname": party_name,
             "basicbasepartyname": party_name,
-            "basicbuyername": self.company.name,
-            "placeofsupply": self.company.state,
-            "cmpgststate": self.company.state,
-            "consigneestatename": self.company.state,
+            "basicbuyername": buyer_name,
+            "placeofsupply": buyer_state,
+            "cmpgststate": buyer_state,
+            "consigneestatename": buyer_state,
             "consigneecountryname": "India",
-            "cmpgstin": self.company.gstin,
-            "consigneegstin": self.company.gstin,
-            "consigneepincode": self.company.pincode,
+            "cmpgstin": buyer_gstin,
+            "consigneegstin": buyer_gstin,
+            "consigneepincode": buyer_pincode,
+            "consigneemailingname": buyer_name,
             "reference": _text(computed.header.invoice_no) or "",
             "costcentrename": cost_centre,
             "numberingstyle": "Auto",
@@ -499,6 +603,13 @@ class TallyExporter:
             "isdeemedpositive": False,
             "iseligibleforitc": True,
         }
+        # Seller (supplier) address block and buyer address block, populated
+        # from the BOE so Tally shows the correct parties.
+        if seller_addr:
+            shell["address"] = self._string_block(seller_addr)
+        if buyer_addr:
+            shell["basicbuyeraddress"] = self._string_block(buyer_addr)
+        return shell
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +631,31 @@ def _distinct_rates(computed: ComputedDocument) -> list[float]:
         if not any(_same_rate(r, x) for x in rates):
             rates.append(r)
     return sorted(rates)
+
+
+def apply_stock_names(computed: ComputedDocument, names: dict[int, str]) -> ComputedDocument:
+    """Return a copy of ``computed`` with mapped "as per Tally" stock names.
+
+    ``names`` maps a line's serial number to the canonical Tally stock-item name
+    chosen in Step 2. The name replaces that line's ``description`` (the field
+    the exporter reads for ``stockitemname``); lines without a mapping are left
+    unchanged. This lets the in-memory JSON path use the Step 2 selections
+    without going through an Excel round-trip.
+    """
+    if not names:
+        return computed
+    new_lines = []
+    for line in computed.lines:
+        mapped = names.get(line.source.item_serial)
+        if mapped and mapped.strip():
+            new_source = replace(
+                line.source,
+                description=RawValue(raw_text=mapped.strip(), parsed=mapped.strip()),
+            )
+            new_lines.append(replace(line, source=new_source))
+        else:
+            new_lines.append(line)
+    return replace(computed, lines=new_lines)
 
 
 def _tally_date(be_date: str | None) -> str:

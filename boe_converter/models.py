@@ -62,6 +62,17 @@ class HeaderBlock:
     invoice_currency: RawValue    # Req 2.5
     package_count: RawValue       # PKG/CTN total e.g. 1357 (Req 2.6, 7.5)
     container_details: RawValue   # container number + count (Req 2.8)
+    # --- Buyer (importer) identity, extracted from Part I "IMPORTER" block ---
+    # These feed the Tally voucher (cmpgstin/consignee*/basicbuyeraddress) so the
+    # buyer is populated FROM THE BOE rather than a hardcoded default. Each
+    # defaults to missing and is never invented when absent.
+    buyer_gstin: RawValue = field(default_factory=RawValue.missing)
+    buyer_address: RawValue = field(default_factory=RawValue.missing)
+    buyer_pincode: RawValue = field(default_factory=RawValue.missing)
+    buyer_state: RawValue = field(default_factory=RawValue.missing)
+    # --- Seller (supplier) identity, extracted from Part I "SUPPLIER" block ---
+    seller_address: RawValue = field(default_factory=RawValue.missing)
+    seller_country: RawValue = field(default_factory=RawValue.missing)
 
 
 @dataclass(frozen=True)
