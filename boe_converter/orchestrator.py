@@ -37,6 +37,7 @@ Design references: design.md "Conversion Orchestrator", "Error Handling"
 from __future__ import annotations
 
 import logging
+import math
 import secrets
 import time
 from dataclasses import dataclass, field, replace
@@ -52,6 +53,7 @@ from boe_converter.models import (
     ExtractedDocument,
     GrandTotalCheck,
     GrandTotalVerification,
+    LineItem,
     RawValue,
     ReviewFlag,
     ReviewFlagSet,
@@ -135,6 +137,16 @@ def _as_number(rv: RawValue | None) -> float | None:
     if isinstance(parsed, (int, float)):
         return float(parsed)
     return None
+
+
+def _detail_number(detail: dict, key: str) -> float | None:
+    """Numeric invoice value for ``key`` (else ``None``).
+
+    Guards against hand-built detail mappings in tests carrying plain numbers:
+    only a ``RawValue`` is interpreted, anything else counts as absent.
+    """
+    value = detail.get(key)
+    return _as_number(value) if isinstance(value, RawValue) else None
 
 
 class ConversionOrchestrator:
@@ -282,6 +294,13 @@ class ConversionOrchestrator:
         (unreadable invoice, unexpected layout) is swallowed and logged - the BOE
         conversion proceeds unchanged so an optional, malformed invoice never
         fails the whole conversion.
+
+        For every matched line the BOE quantity, unit price and amount are also
+        compared against the invoice's TOTAL QTY / UNIT PRICE / TOTAL AMOUNT;
+        differing fields are recorded on the line (``invoice_mismatch``) so the
+        Excel generator can red-fill that row. A field is only compared when
+        both sides are numeric - anything missing or unreadable skips that
+        field's comparison instead of flagging it.
         """
         try:
             import io
@@ -307,8 +326,56 @@ class ConversionOrchestrator:
             # precedence over the BOE description (Excel column E / stock name).
             if detail.get("description") is not None:
                 changes["description"] = detail["description"]
+            mismatched = self._invoice_value_mismatches(item, detail)
+            if mismatched:
+                changes["invoice_mismatch"] = mismatched
             new_items.append(replace(item, **changes) if changes else item)
         return replace(extracted, line_items=new_items)
+
+    @staticmethod
+    def _invoice_value_mismatches(
+        item: LineItem, detail: dict
+    ) -> tuple[str, ...]:
+        """Names of BOE-vs-invoice value fields that differ for one line.
+
+        Compares quantity, unit price, and amount (the BOE amount is
+        ``unit_price x quantity`` recomputed here; the BOE prints no per-line
+        amount field). Quantity and unit price count only when both sides are
+        numeric and differ beyond float dust (``math.isclose`` with a sub-paisa
+        absolute tolerance). Amount is compared rounded to cents: the invoice
+        prints amounts to 2 decimals, so a half-cent rounding difference
+        (e.g. ``8333.5 x 0.15 = 1250.025`` printed as ``1250.03``) is not a
+        mismatch - only a difference beyond half a cent plus dust flags.
+        Returns ``()`` when nothing differs.
+        """
+        boe_qty = _as_number(item.quantity)
+        boe_price = _as_number(item.unit_price_usd)
+        boe_amount = (
+            boe_price * boe_qty
+            if boe_price is not None and boe_qty is not None
+            else None
+        )
+        mismatched: list[str] = []
+        inv_qty = _detail_number(detail, "quantity")
+        if (
+            boe_qty is not None
+            and inv_qty is not None
+            and not math.isclose(boe_qty, inv_qty, rel_tol=1e-9, abs_tol=1e-6)
+        ):
+            mismatched.append("quantity")
+        inv_price = _detail_number(detail, "unit_price")
+        if (
+            boe_price is not None
+            and inv_price is not None
+            and not math.isclose(boe_price, inv_price, rel_tol=1e-9, abs_tol=1e-6)
+        ):
+            mismatched.append("unit_price_usd")
+        inv_amount = _detail_number(detail, "amount")
+        if boe_amount is not None and inv_amount is not None and not math.isclose(
+            boe_amount, inv_amount, rel_tol=1e-9, abs_tol=0.005 + 1e-6
+        ):
+            mismatched.append("amount_usd")
+        return tuple(mismatched)
 
     # ------------------------------------------------------------------
     # Download token store

@@ -304,3 +304,50 @@ def test_page_without_a_header_yields_nothing():
     data row must not be mistaken for one (it would misplace every column)."""
     page = row(120, 1, ["SILICONE", "SEALANT"], [ctn("1", 120)], 20, "CTN")
     assert parse(page) == {}
+
+
+# ---------------------------------------------------------------------------
+# Invoice value columns (TOTAL QTY / UNIT PRICE / TOTAL AMOUNT)
+# ---------------------------------------------------------------------------
+def _details(*pages) -> dict:
+    return InvoicePackingListParser().parse_line_details(
+        _Doc(*[_Page(words) for words in pages])
+    )
+
+
+def _val(detail, key):
+    v = detail.get(key)
+    return None if v is None else v.parsed
+
+
+def test_value_columns_are_captured_per_row():
+    page = header() + row(120, 1, ["SLIDERS"], [ctn("131", 120)], 4000, "PCS")
+    d = _details(page)[1]
+    assert _val(d, "quantity") == 4000
+    assert _val(d, "unit_price") == 0.5
+    assert _val(d, "amount") == 2000
+
+
+def test_value_cells_with_currency_and_separators():
+    words = (
+        header()
+        + [W("1", 30, 38, 120), W("KEYCHAIN", 100, 160, 120), W("85", 334, 346, 120)]
+        + [W("2913.5", 395, 420, 120), W("DOZ", 440, 458, 120)]
+        + [W("$0.12", 480, 505, 120), W("$1,500.00", 540, 580, 120)]
+    )
+    d = _details(words)[1]
+    assert _val(d, "quantity") == 2913.5
+    assert _val(d, "unit_price") == 0.12
+    assert _val(d, "amount") == 1500.0
+
+
+def test_blank_value_cells_yield_none():
+    words = (
+        header()
+        + [W("1", 30, 38, 120), W("WIRE", 100, 140, 120)]
+        + [W("PCS", 440, 458, 120)]
+    )
+    d = _details(words)[1]
+    assert _val(d, "quantity") is None
+    assert _val(d, "unit_price") is None
+    assert _val(d, "amount") is None

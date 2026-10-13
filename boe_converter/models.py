@@ -123,6 +123,14 @@ class LineItem:
     # itself; optionally supplied from the supplier invoice and joined on
     # ``item_serial`` (defaults to missing -> the CTN cell stays blank).
     cartons: RawValue = field(default_factory=RawValue.missing)
+    # BOE-vs-invoice value differences for Excel row highlighting. Set by the
+    # orchestrator when a supplied invoice states a different quantity, unit
+    # price or amount for this serial; empty when the invoice was absent, the
+    # row unmatched, a side non-numeric, or all compared values agreed. Names
+    # the differing fields (subset of "quantity", "unit_price_usd",
+    # "amount_usd"). Read by the Excel generator only - never fabricated,
+    # never affects any math.
+    invoice_mismatch: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

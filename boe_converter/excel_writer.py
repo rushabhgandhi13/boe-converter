@@ -74,6 +74,10 @@ _TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "ctn_template.x
 _TEMPLATE_FIRST_DATA_ROW = 13
 _TEMPLATE_LAST_DATA_ROW = 60          # styled data region rows 13..60
 _TEMPLATE_TOTALS_ROW = 61
+# Blank item rows left between the last line item and the Totals_Row, so the
+# total always sits two rows below the data (e.g. 18 items in rows 13..30 put
+# the totals at row 33) instead of at a fixed row with a gap of empty rows.
+BLANK_ROWS_AFTER_ITEMS = 2
 # A representative interior data row whose per-column styling (borders, number
 # formats, fonts) is cloned onto continuation rows when a document has more
 # line items than the template's styled data region (overflow handling).
@@ -120,12 +124,22 @@ COL_RATE_PER_UNIT = 25            # Y  Ratepurchase per unitPcs/KGS/SET (compute
 ITEM_TABLE_HEADER_ROW = 12
 ITEM_TABLE_FIRST_DATA_ROW = 13
 
-# The Totals_Row's default position (row 61), used when the document fits within
-# the template's styled data region (<=48 items). When a document has more line
-# items than the region, the totals row and the auxiliary sections below it are
-# shifted down by the overflow amount so they never collide with item rows
-# (dynamic positioning); see ``_resolve_layout`` / ``_expand_for_overflow``.
+# The Totals_Row's template position (row 61 in the sample). The actual totals
+# row floats: two blank rows below the last line item
+# (``_totals_row_for(n_items)``), so a short document has no bank of empty rows
+# and a long one still never collides with the items. ``shift`` throughout the
+# writer is the signed displacement of the actual totals row from this anchor
+# (negative when rows were removed, positive on overflow).
 TOTALS_ROW = 61
+
+
+def _totals_row_for(n_items: int) -> int:
+    """Return the Totals_Row for ``n_items`` line items.
+
+    Items occupy rows 13..(12+N); two blank rows follow; the totals sit below
+    them (row 15+N). An empty document still leaves its two blanks (row 15).
+    """
+    return _TEMPLATE_FIRST_DATA_ROW + max(n_items, 0) + BLANK_ROWS_AFTER_ITEMS
 
 # The constant SWS rate written into column V for every line item (sample V=0.1).
 SWS_RATE = 0.10
@@ -142,6 +156,15 @@ GRAND_TOTAL_FILL_COLUMNS: dict[str, int] = {
 # Solid red fill applied to a Totals_Row cell whose grand total mismatches the
 # BOE declared value (Req 11.4). MATCH/UNVERIFIED columns stay unstyled.
 GRAND_TOTAL_MISMATCH_FILL = PatternFill(
+    fill_type="solid", fgColor="FFFF0000", start_color="FFFF0000"
+)
+
+# Solid red fill applied to every cell of an item row whose BOE quantity, unit
+# price or amount differs from the supplier invoice (see
+# ``LineItem.invoice_mismatch``). Same red as a grand-total mismatch: either
+# way the operator must look at the row before booking it. Rows that agree -
+# or were never compared (no invoice supplied) - keep the template styling.
+INVOICE_MISMATCH_FILL = PatternFill(
     fill_type="solid", fgColor="FFFF0000", start_color="FFFF0000"
 )
 
@@ -292,14 +315,15 @@ def _sum_optional(values) -> float:
 
 
 def _shift_coord(coordinate: str, shift: int) -> str:
-    """Return ``coordinate`` with its row shifted down by ``shift`` rows.
+    """Return ``coordinate`` with its row shifted by ``shift`` rows.
 
     Used to relocate the auxiliary-section labels (and the ``total usd`` value
-    cell) when the line-item count overflows the template's styled data region.
-    A non-positive ``shift`` returns the coordinate unchanged, so documents that
-    fit the template keep the sample's exact cell positions (Req 8.2/8.3).
+    cell) when the Totals_Row floats away from the template anchor: down on
+    overflow (positive ``shift``), up when unused blank rows were removed
+    (negative ``shift``). A zero ``shift`` returns the coordinate unchanged, so
+    a 46-item document keeps the sample's exact cell positions (Req 8.2/8.3).
     """
-    if shift <= 0:
+    if shift == 0:
         return coordinate
     row, col = coordinate_to_tuple(coordinate)
     return f"{get_column_letter(col)}{row + shift}"
@@ -360,19 +384,21 @@ class ExcelGenerator:
 
         When the document has more line items than the template's styled data
         region (rows 13..60), the totals row and the auxiliary sections below it
-        are shifted down so they never overlap the item rows; the additional
-        item rows inherit the data-row styling (see ``_expand_for_overflow``).
+        are shifted down so they never overlap the item rows; when it has
+        fewer, the unused blank rows are removed so the totals sit two rows
+        below the last item instead of leaving a bank of empty rows; the aux
+        sections move with the totals either way (see ``_fit_layout``).
         """
         wb = _load_template()
         ws = wb["Sheet1"]
 
         n_items = len(doc.lines)
-        last_data_row = _TEMPLATE_FIRST_DATA_ROW + n_items - 1
-        # Overflow: how far the data extends past the template's styled region.
-        shift = max(0, last_data_row - _TEMPLATE_LAST_DATA_ROW)
+        totals_row = _totals_row_for(n_items)
+        # Signed displacement from the template anchor: negative when blank
+        # rows are removed, positive on overflow, zero for exactly 46 items.
+        shift = totals_row - _TEMPLATE_TOTALS_ROW
         if shift:
-            self._expand_for_overflow(ws, shift)
-        totals_row = _TEMPLATE_TOTALS_ROW + shift
+            self._fit_layout(ws, shift, totals_row)
 
         self._prepare_template(ws, n_items, totals_row)
         self._write_header_block(ws, doc.header, flags)
@@ -385,24 +411,25 @@ class ExcelGenerator:
         return wb
 
     # ------------------------------------------------------------------
-    # Overflow handling (shift totals + aux sections below the item rows)
+    # Layout fitting (float the totals row to two blanks below the items)
     # ------------------------------------------------------------------
-    def _expand_for_overflow(self, ws: Worksheet, shift: int) -> None:
-        """Make room for ``shift`` extra line-item rows below the data region.
+    def _fit_layout(self, ws: Worksheet, shift: int, totals_row: int) -> None:
+        """Move the totals row and aux sections by signed ``shift`` rows.
 
-        Inserts ``shift`` rows immediately before the template totals row, which
-        pushes the totals row and every auxiliary section below it down by
-        ``shift`` (their values and styles move with them). openpyxl does not
-        relocate merged ranges on insert, so the aux merges (``G71:O71``,
-        ``Q71:X71``, ``G94:O94``) are re-created at their shifted positions. The
-        freshly inserted rows arrive unstyled, so each one is given the data-row
-        styling cloned from a representative template data row, keeping the new
-        item rows visually identical to the originals.
+        Positive ``shift`` (more than 46 items) inserts rows before the
+        template totals row, pushing it and every auxiliary section down; the
+        new continuation rows get data-row styling. Negative ``shift`` (fewer
+        than 46 items) deletes the unused blank data rows starting at the new
+        totals position, pulling the template totals row and aux sections up
+        so no bank of empty rows remains. openpyxl relocates neither merges
+        nor (on delete) reliably all dimensions, so the aux merges at/below
+        the template totals row are re-created at their shifted positions.
         """
-        # Capture and release the merges that sit at/below the totals row before
-        # inserting. They must be unmerged while their cells still exist (openpyxl
-        # does not relocate merge coordinates on insert, so unmerging by the old
-        # coordinates afterwards would fail once the cells have shifted).
+        # Capture and release the merges that sit at/below the totals row
+        # before moving rows. They must be unmerged while their cells still
+        # exist (openpyxl does not relocate merge coordinates on
+        # insert/delete, so unmerging by the old coordinates afterwards would
+        # fail once the cells have shifted).
         below_specs = [
             (rng.min_row, rng.min_col, rng.max_row, rng.max_col)
             for rng in list(ws.merged_cells.ranges)
@@ -414,7 +441,19 @@ class ExcelGenerator:
                 end_row=max_row, end_column=max_col,
             )
 
-        ws.insert_rows(_TEMPLATE_TOTALS_ROW, shift)
+        if shift > 0:
+            ws.insert_rows(_TEMPLATE_TOTALS_ROW, shift)
+        else:
+            # Drop data-region scaffolding merges overlapping the removed
+            # band (e.g. the sample's G36:G57): their rows disappear, so the
+            # merge must not survive shifted onto the aux sections. The item
+            # writer needs unmerged cells anyway (see ``_prepare_template``).
+            for rng in list(ws.merged_cells.ranges):
+                if rng.max_row >= totals_row and rng.min_row < _TEMPLATE_TOTALS_ROW:
+                    ws.unmerge_cells(str(rng))
+            # Remove the unused blank data rows starting at the new totals
+            # position; the template totals row slides up into place.
+            ws.delete_rows(totals_row, -shift)
 
         # Re-create the captured merges at their shifted positions.
         for min_row, min_col, max_row, max_col in below_specs:
@@ -425,10 +464,16 @@ class ExcelGenerator:
                 end_column=max_col,
             )
 
-        # Style the newly inserted continuation rows like a real data row.
-        self._clone_data_row_style(
-            ws, _TEMPLATE_TOTALS_ROW, _TEMPLATE_TOTALS_ROW + shift - 1
-        )
+        if shift > 0:
+            # Style the newly inserted continuation rows like a real data row.
+            self._clone_data_row_style(
+                ws, _TEMPLATE_TOTALS_ROW, _TEMPLATE_TOTALS_ROW + shift - 1
+            )
+
+    # Backwards-compatible alias (overflow-only callers/tests).
+    def _expand_for_overflow(self, ws: Worksheet, shift: int) -> None:
+        """Insert ``shift`` rows before the template totals row (see ``_fit_layout``)."""
+        self._fit_layout(ws, shift, _TEMPLATE_TOTALS_ROW + shift)
 
     @staticmethod
     def _clone_data_row_style(ws: Worksheet, first_row: int, last_row: int) -> None:
@@ -459,11 +504,12 @@ class ExcelGenerator:
         only this document's data is written, while leaving every style, width,
         height and the auxiliary scaffolding intact. Merged ranges that fall in
         the line-item write region are unmerged so each item keeps its own row.
-        ``totals_row`` is the (possibly shifted) row the totals are written to;
-        the data region and that row are cleared together.
+        ``totals_row`` is the floating totals position (two blanks below the
+        last item); the layout fit already removed/inserted rows, so rows
+        13..totals_row are exactly the items, the two blanks and the totals.
         """
         last_data_row = _TEMPLATE_FIRST_DATA_ROW + max(n_items, 0) - 1
-        write_end = max(_TEMPLATE_LAST_DATA_ROW, last_data_row)
+        write_end = max(last_data_row, totals_row)
 
         # Unmerge any merged range intersecting the data write region (e.g. the
         # sample's G36:G57) so per-row writes never target a merged cell.
@@ -480,28 +526,30 @@ class ExcelGenerator:
             ws[coord] = None
 
         # Clear the data region and the totals row (cols A..Y), keeping styles.
-        for row in range(_TEMPLATE_FIRST_DATA_ROW, max(write_end, totals_row) + 1):
+        for row in range(_TEMPLATE_FIRST_DATA_ROW, write_end + 1):
             for col in range(1, COL_RATE_PER_UNIT + 1):
                 ws.cell(row=row, column=col).value = None
 
-        # Harmonize the styled data region. The bundled template carries a few
-        # hand-edited rows (58-60) with stray bold / missing-highlight quirks
-        # left over from the original sample; cloning the canonical data row's
-        # per-column style across the whole region makes every item row render
-        # identically (Req 8.x visual fidelity).
-        self._normalize_data_region_style(ws)
+        # Harmonize the item-row styling (see ``_normalize_data_region_style``).
+        self._normalize_data_region_style(ws, totals_row)
 
     @staticmethod
-    def _normalize_data_region_style(ws: Worksheet) -> None:
-        """Clone the canonical data-row style across rows 13..60.
+    def _normalize_data_region_style(ws: Worksheet, totals_row: int | None = None) -> None:
+        """Clone the canonical data-row style across the item rows.
 
         Copies the per-column style (fonts, fills, borders, number formats) from
-        ``_TEMPLATE_STYLE_ROW`` onto every row of the template's styled data
-        region so the hand-edited inconsistencies in the sample's last rows
-        (e.g. row 60's stray bold, rows 58-59's missing column-O highlight) do
-        not surface when those rows carry item data. Values are untouched.
+        ``_TEMPLATE_STYLE_ROW`` onto every item/blank row below the header so
+        the hand-edited inconsistencies in the sample's last rows (e.g. row
+        60's stray bold, rows 58-59's missing column-O highlight) do not
+        surface. Values are untouched. When ``totals_row`` is given only rows
+        above it are touched, so the aux sections below the totals keep their
+        own styling; otherwise the template region 13..60 is covered.
         """
-        for row in range(_TEMPLATE_FIRST_DATA_ROW, _TEMPLATE_LAST_DATA_ROW + 1):
+        if totals_row is None:
+            end_row = _TEMPLATE_LAST_DATA_ROW
+        else:
+            end_row = min(_TEMPLATE_LAST_DATA_ROW, totals_row - 1)
+        for row in range(_TEMPLATE_FIRST_DATA_ROW, end_row + 1):
             if row == _TEMPLATE_STYLE_ROW:
                 continue
             for col in range(1, COL_RATE_PER_UNIT + 1):
@@ -611,6 +659,9 @@ class ExcelGenerator:
         G (CTN) have no BOE/configuration source in Milestone 1 and are left
         blank for every row (Req 8.6, mapping table). Review-flagged computed
         values are already ``None`` on the ``ComputedLine`` and so write blank.
+        A row whose BOE values differ from the supplier invoice (see
+        ``LineItem.invoice_mismatch``) is red-filled across A-Y so the operator
+        spots it on open; every other row keeps the template styling.
         """
         item = line.source
 
@@ -710,32 +761,51 @@ class ExcelGenerator:
         else:
             self._set_cell(ws, row, COL_RATE_PER_UNIT, line.purchase_rate_per_unit)
 
+        # BOE-vs-invoice mismatch: red-fill the whole item row (A-Y) when the
+        # orchestrator found this serial's quantity, unit price or amount
+        # differing between the two PDFs. Applied last so it only restyles -
+        # values, formulas, borders and number formats are untouched.
+        if item.invoice_mismatch:
+            for col in range(COL_SR_NO, COL_RATE_PER_UNIT + 1):
+                ws.cell(row=row, column=col).fill = INVOICE_MISMATCH_FILL
+
     # ------------------------------------------------------------------
-    # Totals row (row 61)
+    # Totals row (two blank rows below the last item)
     # ------------------------------------------------------------------
     def _write_totals_row(
         self, ws: Worksheet, totals: Totals, lines: list[ComputedLine], totals_row: int
     ) -> None:
-        """Write the Totals_Row at ``totals_row`` (row 61, or shifted on overflow).
+        """Write the Totals_Row at ``totals_row`` (two blanks below the items).
 
         Reproduces the sample's summed columns (``G, L, M, N, O, P, Q, S, U, W,
         X``) at full floating-point precision (Req 7.4, 8.2). Columns backed by
         a pre-computed ``Totals`` field use it directly (L, N, O, P, Q, X); the
-        remaining column sums (M, S, U, W) are summed here from the per-line
+        remaining column sums (G, M, S, U, W) are summed here from the per-line
         values exactly as written into those columns, matching the sample's
-        ``SUM`` formulas. Column G carries the BOE total package/CTN count taken
-        from ``Totals.package_count`` (Req 7.5); if it is missing the cell is
-        left blank rather than substituting a value.
+        ``SUM`` formulas. Column G carries the ``SUM`` of the per-line carton
+        cells when the invoice supplied any carton counts, else the BOE total
+        package/CTN count taken from ``Totals.package_count`` (Req 7.5); if
+        that is missing the cell is left blank rather than substituting a value.
         """
         row = totals_row
         n = len(lines)
         first = ITEM_TABLE_FIRST_DATA_ROW
         last = first + n - 1  # inclusive last data row; < first when no items
 
-        # G: CTN total = BOE total package count (Req 7.5). Per-line CTN cells are
-        # blank in Milestone 1; the total is the extracted package count and is
-        # always written as a literal (never a SUM of the empty per-line column).
-        self._set_cell(ws, row, COL_CTN, _raw_cell_value(totals.package_count))
+        # G: CTN total = SUM of the per-line carton cells when the invoice
+        # supplied any carton counts (a live =SUM formula in formula mode, the
+        # pre-evaluated sum otherwise), so the total always agrees with the
+        # column above it. With no per-line cartons (no invoice supplied) it
+        # falls back to the BOE total package count (Req 7.5), blank when that
+        # is missing rather than substituting a value.
+        carton_vals = [
+            v for v in (_raw_number(ln.source.cartons) for ln in lines)
+            if v is not None
+        ]
+        if carton_vals:
+            self._put_total(ws, row, COL_CTN, "G", first, last, sum(carton_vals))
+        else:
+            self._set_cell(ws, row, COL_CTN, _raw_cell_value(totals.package_count))
 
         # The remaining summed columns mirror the sample's ``=SUM(<col>13:<col>N)``
         # formulas in formula mode, or the pre-evaluated literal otherwise.
@@ -802,7 +872,7 @@ class ExcelGenerator:
         """Write the auxiliary section labels verbatim at their (shifted) positions.
 
         Reproduces character-for-character (Req 8.3): the ``total usd`` summary
-        (B71 label + E71 value mirroring ``=L61``), the ``DETAILS AS PER
+        (B71 label + E71 value mirroring ``=L<totals>``), the ``DETAILS AS PER
         CHALLANS`` and ``DETAILS AS PER TALLY`` section titles with their
         column-header rows, the C&F detail block row labels (B72-B86), and the
         ``CLEARANCE AND FORWARDING INVOICE`` title with its header row. When the
@@ -816,7 +886,7 @@ class ExcelGenerator:
             ws[_shift_coord(coordinate, shift)] = label
 
         # 'total usd' value cell: the sample stores '=L61'; mirror that with a
-        # live formula in formula mode, or the evaluated literal otherwise. The
+        # live formula pointing at the floating totals row in formula mode,
         # Totals_Row L cell holds the identical value/formula.
         target = _shift_coord(AUX_TOTAL_USD_CELL, shift)
         if self.use_formulas:

@@ -12,7 +12,12 @@ import io
 
 from openpyxl import load_workbook
 
-from boe_converter.excel_writer import ExcelGenerator
+from boe_converter.excel_writer import (
+    TOTALS_ROW,
+    ExcelGenerator,
+    _shift_coord,
+    _totals_row_for,
+)
 from boe_converter.models import (
     ComputedDocument,
     HeaderBlock,
@@ -52,19 +57,28 @@ def _ws(doc):
     return load_workbook(io.BytesIO(xlsx)).active
 
 
+def _shift(doc) -> int:
+    """Signed aux displacement for ``doc`` (footer floats with the totals)."""
+    return _totals_row_for(len(doc.lines)) - TOTALS_ROW
+
+
 def test_footer_reflects_boe_header():
-    ws = _ws(_doc())
-    assert ws["E75"].value == "9999999"        # B/E NO
-    assert ws["E76"].value == "31/12/2025"     # B/E DATE
-    assert ws["E77"].value == "BL-ABC-123"     # BL NO
-    assert ws["E78"].value == "15/12/2025"     # BL DATE
+    doc = _doc()
+    ws = _ws(doc)
+    shift = _shift(doc)
+    assert ws[_shift_coord("E75", shift)].value == "9999999"        # B/E NO
+    assert ws[_shift_coord("E76", shift)].value == "31/12/2025"     # B/E DATE
+    assert ws[_shift_coord("E77", shift)].value == "BL-ABC-123"     # BL NO
+    assert ws[_shift_coord("E78", shift)].value == "15/12/2025"     # BL DATE
 
 
 def test_footer_clears_missing_fields_no_template_bleed():
-    ws = _ws(_doc(bl_no=RawValue.missing(), bl_date=RawValue.missing()))
+    doc = _doc(bl_no=RawValue.missing(), bl_date=RawValue.missing())
+    ws = _ws(doc)
+    shift = _shift(doc)
     # Missing BL must clear the template's value rather than leave it.
-    assert ws["E77"].value is None
-    assert ws["E78"].value is None
+    assert ws[_shift_coord("E77", shift)].value is None
+    assert ws[_shift_coord("E78", shift)].value is None
     # Present fields still populate.
-    assert ws["E75"].value == "9999999"
-    assert ws["E76"].value == "31/12/2025"
+    assert ws[_shift_coord("E75", shift)].value == "9999999"
+    assert ws[_shift_coord("E76", shift)].value == "31/12/2025"

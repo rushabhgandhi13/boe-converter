@@ -7,7 +7,7 @@ a full round-trip:
 
 - **Req 1.3 / 1.8** - a recognized BOE converts to a downloadable ``Sheet1``
   workbook within the 60-second budget, with the expected 45 line items in
-  dense rows from row 13 and the Totals_Row at row 61.
+  dense rows from row 13 and the Totals_Row two blank rows below them.
 - **Golden output** - the values the system derives *directly from extraction*
   (column L invoice amount total, column N assessable-value total, and the
   column G package count) match the evaluated values stored in the sample
@@ -70,7 +70,7 @@ USD_RATE = 95.3
 EXPECTED_LINE_ITEMS = 45
 FIRST_DATA_ROW = 13
 LAST_DATA_ROW = FIRST_DATA_ROW + EXPECTED_LINE_ITEMS - 1  # 57
-TOTALS_ROW = 61
+TOTALS_ROW = LAST_DATA_ROW + 3  # two blank rows, then totals (60)
 TIME_BUDGET_SECONDS = 60.0
 
 # Column indices (1-based) for the directly-extraction-derived totals compared
@@ -110,8 +110,8 @@ def reference_pdf_bytes() -> bytes:
 # ---------------------------------------------------------------------------
 def test_end_to_end_convert_and_download_within_budget(reference_pdf_bytes):
     """Req 1.3/1.8 - the reference BOE converts to a downloadable Sheet1
-    workbook within 60s, with 45 dense line items from row 13 and totals at
-    row 61.
+    workbook within 60s, with 45 dense line items from row 13 and totals two
+    blank rows below them (row 60).
 
     Drives the real HTTP API end to end via ``TestClient``: POST the PDF with
     ``usd_rate=95.3``, assert the success body (token + summary with 45 items),
@@ -219,12 +219,15 @@ def test_generated_totals_match_golden_workbook(reference_pdf_bytes):
 
         compared = 0
         skipped = []
+        # The golden sample keeps its totals at row 61; the generated workbook
+        # floats its totals two blanks below the items (row 60 for 45 items).
+        GOLDEN_TOTALS_ROW = 61
         for col, name in (
             (COL_L_AMOUNT, "L (Amount USD total)"),
             (COL_N_ASSESS, "N (assessable value total)"),
             (COL_G_PACKAGE, "G (package count)"),
         ):
-            golden_value = golden.cell(row=TOTALS_ROW, column=col).value
+            golden_value = golden.cell(row=GOLDEN_TOTALS_ROW, column=col).value
             gen_value = gen.cell(row=TOTALS_ROW, column=col).value
 
             # If the golden value cannot be read (formula without a cached

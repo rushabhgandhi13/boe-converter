@@ -57,6 +57,17 @@ _DIGIT_JOIN_GAP = 6.0
 # pitch (~15pt+) stays well outside it.
 _ROW_STITCH_GAP = 8.0
 
+# Header words locating the invoice value columns, mapped to the detail key
+# they fill. The header prints them inside longer labels (``TOTAL QTY``,
+# ``UNIT PRICE``, ``TOTAL AMOUNT``), so single-word matching suffices.
+_VALUE_TOKENS = {"QTY": "quantity", "PRICE": "unit_price", "AMOUNT": "amount"}
+
+# Horizontal half-width (points) of each value column band around its header
+# token's centre. Value columns sit a full column apart, so this never reaches
+# a neighbouring column's numbers; the unit column between QTY and PRICE holds
+# no numerics (fused ``4000THD`` splits are centred on it, outside every band).
+_VALUE_BAND = 20.0
+
 # Words marking a totals/footer row: never absorb such a row while stitching,
 # so a footer ("TOTAL CTN : 1159") cannot donate its number to a serial above.
 _NON_DATA_HINTS = {"TOTAL", "SUBTOTAL", "GRAND", "BALANCE"}
@@ -212,14 +223,14 @@ class InvoicePackingListParser:
         }
 
     def parse_line_details(self, doc) -> dict[int, dict]:
-        """Return ``{serial: {"cartons", "description"}}`` per line.
+        """Return ``{serial: {...}}`` per line.
 
         Reads the invoice line table (packing-list pages and the totals row are
-        skipped). For each line the per-line carton count (``TOTAL CTNS`` column)
-        and the ``DESCRIPTION OF GOODS`` text are captured, keyed by ``SR NO``
-        (which maps 1:1 to the BOE line serial). Blank cells yield ``None`` for
-        that field. ``doc`` may be a path, bytes buffer, or an opened
-        ``pdfplumber.PDF``.
+        skipped). For each line the per-line carton count (``TOTAL CTNS`` column),
+        the ``DESCRIPTION OF GOODS`` text, and the ``TOTAL QTY`` / ``UNIT PRICE``
+        / ``TOTAL AMOUNT`` values are captured, keyed by ``SR NO`` (which maps
+        1:1 to the BOE line serial). Blank cells yield ``None`` for that field.
+        ``doc`` may be a path, bytes buffer, or an opened ``pdfplumber.PDF``.
         """
         handle, pages, should_close = self._resolve(doc)
         try:
@@ -325,6 +336,39 @@ class InvoicePackingListParser:
         candidates = hinted + plain
         return candidates[0] if candidates else None
 
+    def _value_columns(self, header_row: list[dict]) -> dict[str, float]:
+        """Map detail key -> column centre for the invoice value columns.
+
+        Looks for the ``QTY`` / ``PRICE`` / ``AMOUNT`` header words in the same
+        header row that carries the carton header (suppliers print ``TOTAL
+        QTY``, ``UNIT PRICE``, ``TOTAL AMOUNT``). A column whose header word is
+        absent simply yields no values - the caller then leaves that field
+        blank rather than guessing from a neighbouring column.
+        """
+        centers: dict[str, float] = {}
+        for w in header_row:
+            key = _VALUE_TOKENS.get(w["text"].strip().upper().strip(".,:;"))
+            if key is not None and key not in centers:
+                centers[key] = self._center(w)
+        return centers
+
+    def _column_value(self, gate: list[dict], center: float) -> RawValue | None:
+        """The money value under a value-column centre, else ``None``.
+
+        The nearest in-band numeric run wins (digit-split tokens are joined
+        first); amounts print with currency symbols and thousand separators
+        (``$1,500.00``), which are stripped before parsing. Anything
+        non-numeric yields ``None`` - a missing value is never fabricated.
+        """
+        nearby = [
+            w for w in gate
+            if center - _VALUE_BAND <= self._center(w) <= center + _VALUE_BAND
+            and self._is_money(w["text"])
+        ]
+        if not nearby:
+            return None
+        return self._money_value(self._join_number_tokens(nearby))
+
     def _parse_page(self, page, details: dict[int, dict]) -> None:
         rows = self._rows(page)
         rows = _stitch_split_rows(rows)
@@ -332,6 +376,7 @@ class InvoicePackingListParser:
         if header is None:
             return
         header_index, ctns_center = header
+        value_centers = self._value_columns(rows[header_index])
         lo, hi = ctns_center - _CTNS_BAND, ctns_center + _CTNS_BAND
         # The description column sits between the SR NO column and the CTNS band.
         desc_hi = ctns_center - _CTNS_BAND
@@ -383,6 +428,14 @@ class InvoicePackingListParser:
                     self._join_number_tokens(ctn_words)
                 )
 
+            # TOTAL QTY / UNIT PRICE / TOTAL AMOUNT under their own header
+            # columns (located once per page above). A column whose header word
+            # was absent, or a blank cell, leaves that field None - a missing
+            # value is never fabricated, and without both sides numeric the
+            # orchestrator simply skips that field's comparison.
+            for field, center in value_centers.items():
+                entry[field] = self._column_value(gate, center)
+
             # Description: all tokens between the SR NO column and the CTNS band,
             # left-to-right (e.g. "SLIDERS (GARMENT ACCESSORY)"). Original
             # words are used so fused names ("126PCS STATIONERY SET") stay
@@ -398,6 +451,23 @@ class InvoicePackingListParser:
     @staticmethod
     def _is_number(text: str) -> bool:
         return bool(re.fullmatch(r"\d+(?:\.\d+)?", text.strip().replace(",", "")))
+
+    @staticmethod
+    def _is_money(text: str) -> bool:
+        """True for a money/quantity token (``4000``, ``0.12``, ``$1,500.00``)."""
+        cleaned = text.strip().replace(",", "").lstrip("$₹€£ ").strip()
+        return bool(re.fullmatch(r"\d+(?:\.\d+)?", cleaned))
+
+    @staticmethod
+    def _money_value(text: str) -> RawValue:
+        """Wrap a money token verbatim, parsing it as an int when whole."""
+        cleaned = text.strip().replace(",", "").lstrip("$₹€£ ").strip()
+        try:
+            number = float(cleaned)
+        except ValueError:
+            return RawValue(raw_text=text.strip(), parsed=text.strip())
+        parsed: float | int = int(number) if number.is_integer() else number
+        return RawValue(raw_text=text.strip(), parsed=parsed)
 
     @staticmethod
     def _join_number_tokens(words: list[dict]) -> str:

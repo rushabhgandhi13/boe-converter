@@ -33,10 +33,14 @@ from boe_converter.excel_writer import (
     COL_RATE_OF_INTEREST_BCD,
     COL_RATE_PER_UNIT,
     COL_RATE_PER_USD,
+    COL_SR_NO,
     COL_SURCHARGE,
     COL_TOTAL_CUSTOM_DUTY,
     COL_TOTAL_CUSTOM_DUTY_2,
+    TOTALS_ROW,
     ExcelGenerator,
+    _shift_coord,
+    _totals_row_for,
 )
 from boe_converter.calculator import ValueCalculator
 from boe_converter.models import (
@@ -154,11 +158,16 @@ def test_usd_rate_integer_renders_without_trailing_zero():
 
 def test_totals_row_uses_sum_over_actual_data_rows():
     ws, _ = _build([_item(s) for s in range(1, 4)])  # 3 items -> rows 13..15
-    totals_row = 61
+    # Totals float: two blank rows below the last item (row 18 here).
+    totals_row = _totals_row_for(3)
+    assert totals_row == 18
     assert ws.cell(row=totals_row, column=COL_AMOUNT).value == "=SUM(L13:L15)"
     assert ws.cell(row=totals_row, column=COL_TOTAL_CUSTOM_DUTY).value == "=SUM(P13:P15)"
-    # 'total usd' aux cell mirrors the totals-row L cell.
-    assert ws["E71"].value == f"=L{totals_row}"
+    # The two rows between the items and the totals stay blank.
+    assert ws.cell(row=16, column=COL_SR_NO).value is None
+    assert ws.cell(row=17, column=COL_SR_NO).value is None
+    # 'total usd' aux cell mirrors the totals-row L cell at its shifted spot.
+    assert ws[_shift_coord("E71", totals_row - TOTALS_ROW)].value == f"=L{totals_row}"
 
 
 def test_zero_qty_writes_literal_zero_not_div_formula():
