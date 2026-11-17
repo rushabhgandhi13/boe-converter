@@ -111,6 +111,46 @@ def test_chcess_missing_input_treated_as_zero():
 
 
 # ---------------------------------------------------------------------------
+# SWS base: not every duty in CUST AIDC is surchargeable
+# ---------------------------------------------------------------------------
+def test_sws_uses_declared_amount_when_rate_base_overstates_it():
+    """BE 5083334 item 15: U includes NCCD 20090.20, which the BOE does not
+    surcharge; the declared SWS is 10% of BCD alone. Trusting the printed
+    rate over the amount added 2009.03 to SWS and 100.45 to IGST."""
+    item = _line(
+        assessable_value=_num(24310.67),
+        bcd_amount=_num(4862.1),
+        other_duties_total=_num(24952.3),  # BCD 4862.1 + NCCD 20090.2
+        sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="486.2", parsed=486.2),
+        igst_rate=_num(0.05),
+    )
+    line = ValueCalculator().compute_line(item, 95.35)
+
+    assert line.cust_aidc == pytest.approx(24952.3)
+    assert line.sws_amount == pytest.approx(486.2)
+    assert line.total_customs_duty == pytest.approx(25438.5)
+    assert line.igst_amount == pytest.approx(0.05 * (24310.67 + 25438.5))
+
+
+def test_sws_keeps_full_precision_when_printed_amount_is_display_rounded():
+    """A one-decimal printed SWS (144.7 for 144.703) is display rounding, not a
+    different base: the rate-derived full-precision value still wins."""
+    item = _line(
+        assessable_value=_num(11576.51),
+        bcd_amount=_num(868.2),
+        chcess_amount=_num(578.83),
+        other_duties_total=_num(1447.03),
+        sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="144.7", parsed=144.7),
+        igst_rate=_num(0.05),
+    )
+    line = ValueCalculator().compute_line(item, 95.35)
+
+    assert line.sws_amount == pytest.approx(144.703)
+
+
+# ---------------------------------------------------------------------------
 # End-to-end extraction fixes (real BOE; skipped when the asset is absent)
 # ---------------------------------------------------------------------------
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent

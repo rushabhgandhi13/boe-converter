@@ -1,23 +1,21 @@
-"""Dynamic positioning: totals row + auxiliary sections shift below the items.
+"""Floating totals row: two blank rows below the items, aux sections follow.
 
-The bundled style template carries a styled data region of rows 13..60, a totals
-row at 61, and the auxiliary sections (``DETAILS AS PER CHALLANS`` / ``DETAILS AS
-PER TALLY`` at row 71, the C&F block, and ``CLEARANCE AND FORWARDING INVOICE`` at
-row 94). When a Bill of Entry has more line items than the template's data
-region, the item rows would previously overrun and collide with the fixed totals
-row and the auxiliary tables.
+The bundled style template carries a styled data region of rows 13..60, a
+totals row at 61, and the auxiliary sections (``DETAILS AS PER CHALLANS`` /
+``DETAILS AS PER TALLY`` at row 71, the C&F block, and ``CLEARANCE AND
+FORWARDING INVOICE`` at row 94). The generator floats the totals row so it
+always sits two blank rows below the last line item: unused blank rows are
+removed for short documents (no bank of empty rows) and rows are inserted for
+long ones, with the aux sections moving with the totals either way.
 
-These tests verify that for a document with many line items:
+These tests verify:
 
 - the item rows remain dense from row 13 (Sr. no. 1..N) with no gaps;
-- the totals row is written immediately below the last item row (not at the
-  fixed row 61) and carries the invoice-amount total;
+- the totals row sits two blank rows below the last item and carries the
+  invoice-amount total (e.g. 18 items in rows 13..30 put the totals at 33);
 - every auxiliary label sits strictly below the totals row, so no label cell is
   overwritten by an item row and no item row is overwritten by a label;
 - the auxiliary section merges follow the labels to their shifted positions.
-
-It also asserts the no-overflow path (a small document) is unchanged: totals stay
-at row 61 and the aux sections stay at their sample positions.
 """
 
 from __future__ import annotations
@@ -31,6 +29,7 @@ from boe_converter.excel_writer import (
     TOTALS_ROW,
     ExcelGenerator,
     _shift_coord,
+    _totals_row_for,
 )
 from boe_converter.models import (
     ComputedDocument,
@@ -102,16 +101,17 @@ def test_overflow_shifts_totals_and_aux_below_items():
     ws, _ = _build(n)
     first = ITEM_TABLE_FIRST_DATA_ROW
 
-    # Dense Sr. no. 1..N from row 13, with the row after the block empty.
+    # Dense Sr. no. 1..N from row 13, with two blank rows after the block.
     sr_values = [ws.cell(row=first + i, column=COL_SR_NO).value for i in range(n)]
     assert sr_values == list(range(1, n + 1))
     last_item_row = first + n - 1  # 92
     assert ws.cell(row=last_item_row + 1, column=COL_SR_NO).value is None
+    assert ws.cell(row=last_item_row + 2, column=COL_SR_NO).value is None
 
-    # Totals row is immediately below the last item row (not the fixed row 61).
-    shift = last_item_row - 60
+    # Totals row floats to two blanks below the last item.
+    shift = _totals_row_for(n) - TOTALS_ROW
     expected_totals_row = TOTALS_ROW + shift
-    assert expected_totals_row == last_item_row + 1
+    assert expected_totals_row == last_item_row + 3
     amount_total = ws.cell(row=expected_totals_row, column=COL_AMOUNT).value
     assert isinstance(amount_total, (int, float)) and amount_total > 0
 
@@ -140,32 +140,66 @@ def test_overflow_shifts_totals_and_aux_below_items():
     assert _shift_coord("G94", shift) + ":" + _shift_coord("O94", shift) in merged
 
 
-def test_no_overflow_keeps_sample_positions():
-    """A small document keeps the totals at row 61 and aux at sample rows."""
-    ws, _ = _build(10)
-
-    # Totals at the fixed sample row, with the amount total present.
-    amount_total = ws.cell(row=TOTALS_ROW, column=COL_AMOUNT).value
-    assert isinstance(amount_total, (int, float)) and amount_total > 0
-
-    # Aux labels remain at their original (unshifted) coordinates.
-    for coord, label in AUX_LABELS.items():
-        assert ws[coord].value == label
-
-    # Original aux merges are intact.
-    merged = {str(rng) for rng in ws.merged_cells.ranges}
-    assert "G71:O71" in merged
-    assert "Q71:X71" in merged
-    assert "G94:O94" in merged
-
-
-def test_boundary_exactly_fills_region():
-    """48 items exactly fills rows 13..60; totals stay at row 61 (no shift)."""
-    n = 48
+def test_short_document_floats_totals_two_blanks_below_items():
+    """18 items: totals at row 33 (not 61), aux shifted up with it."""
+    n = 18
     ws, _ = _build(n)
     first = ITEM_TABLE_FIRST_DATA_ROW
-    assert ws.cell(row=first + n - 1, column=COL_SR_NO).value == n  # row 60
-    assert ws.cell(row=TOTALS_ROW, column=COL_SR_NO).value is None  # row 61 clear of items
+    last_item_row = first + n - 1  # 30
+
+    expected_totals_row = _totals_row_for(n)
+    assert expected_totals_row == 33 == last_item_row + 3
+    # The two rows between the items and the totals stay blank.
+    assert ws.cell(row=last_item_row + 1, column=COL_SR_NO).value is None
+    assert ws.cell(row=last_item_row + 2, column=COL_SR_NO).value is None
+    amount_total = ws.cell(row=expected_totals_row, column=COL_AMOUNT).value
+    assert isinstance(amount_total, (int, float)) and amount_total > 0
+
+    # Aux labels sit below the floating totals at their shifted coordinates.
+    shift = expected_totals_row - TOTALS_ROW
+    for coord, label in AUX_LABELS.items():
+        shifted = _shift_coord(coord, shift)
+        row, _col = coordinate_to_tuple(shifted)
+        assert row > expected_totals_row, f"{coord}->{shifted} overlaps items/totals"
+        assert ws[shifted].value == label
+    assert ws[_shift_coord(AUX_TOTAL_USD_CELL, shift)].value == amount_total
+
+    # The shifted aux section merges exist at their new positions.
+    merged = {str(rng) for rng in ws.merged_cells.ranges}
+    assert _shift_coord("G71", shift) + ":" + _shift_coord("O71", shift) in merged
+    assert _shift_coord("Q71", shift) + ":" + _shift_coord("X71", shift) in merged
+    assert _shift_coord("G94", shift) + ":" + _shift_coord("O94", shift) in merged
+
+
+def test_no_bank_of_empty_rows_between_items_and_totals():
+    """10 items: totals at row 25; no unused blank data rows remain."""
+    ws, _ = _build(10)
+    expected_totals_row = _totals_row_for(10)
+    assert expected_totals_row == 25
+
+    amount_total = ws.cell(row=expected_totals_row, column=COL_AMOUNT).value
+    assert isinstance(amount_total, (int, float)) and amount_total > 0
+
+    # Aux labels follow the totals up (shift is negative here).
+    shift = expected_totals_row - TOTALS_ROW
+    for coord, label in AUX_LABELS.items():
+        assert ws[_shift_coord(coord, shift)].value == label
+
+    # Original aux merges moved with the labels.
+    merged = {str(rng) for rng in ws.merged_cells.ranges}
+    assert _shift_coord("G71", shift) + ":" + _shift_coord("O71", shift) in merged
+    assert _shift_coord("Q71", shift) + ":" + _shift_coord("X71", shift) in merged
+    assert _shift_coord("G94", shift) + ":" + _shift_coord("O94", shift) in merged
+
+
+def test_boundary_forty_six_items_keeps_sample_positions():
+    """46 items fill rows 13..58; totals land exactly on row 61 (shift 0)."""
+    n = 46
+    ws, _ = _build(n)
+    first = ITEM_TABLE_FIRST_DATA_ROW
+    assert ws.cell(row=first + n - 1, column=COL_SR_NO).value == n  # row 58
+    assert _totals_row_for(n) == TOTALS_ROW == 61
+    assert ws.cell(row=TOTALS_ROW, column=COL_SR_NO).value is None  # blanks then totals
     assert ws.cell(row=TOTALS_ROW, column=COL_AMOUNT).value > 0
 
 

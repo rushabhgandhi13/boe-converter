@@ -33,8 +33,6 @@ from boe_converter.excel_writer import (
     ITEM_TABLE_HEADERS,
     TOTALS_ROW,
     ExcelGenerator,
-    _TEMPLATE_FIRST_DATA_ROW,
-    _TEMPLATE_LAST_DATA_ROW,
     _shift_coord,
 )
 from boe_converter.models import (
@@ -180,19 +178,17 @@ def test_output_structure_and_fixed_labels_match_sample(payload):
             f"expected {label!r} got {cell.value!r}"
         )
 
-    # --- Req 8.2: Totals_Row position (dynamic) -------------------------
-    # The totals row sits at the sample's fixed position (row 61) when the items
-    # fit the template's styled data region; when the line-item count overflows
-    # that region the totals row (and every auxiliary section below it) shift
-    # down by the overflow amount so they never collide with the item rows. At
-    # least one summed column (L = total invoice amount USD) carries the total.
-    from boe_converter.excel_writer import COL_AMOUNT
+    # --- Req 8.2: Totals_Row position (floating) -------------------------
+    # The totals row always sits two blank rows below the last line item; the
+    # auxiliary sections move with it (up for short documents, down on
+    # overflow) so they never collide with the item rows. At least one summed
+    # column (L = total invoice amount USD) carries the total.
+    from boe_converter.excel_writer import COL_AMOUNT, _totals_row_for
 
-    assert TOTALS_ROW == 61
+    assert TOTALS_ROW == 61  # template anchor; actual totals float off it
     n_items = len(computed.lines)
-    last_data_row = _TEMPLATE_FIRST_DATA_ROW + n_items - 1
-    shift = max(0, last_data_row - _TEMPLATE_LAST_DATA_ROW)
-    totals_row = TOTALS_ROW + shift
+    totals_row = _totals_row_for(n_items)
+    shift = totals_row - TOTALS_ROW
     assert ws.cell(row=totals_row, column=COL_AMOUNT).value == computed.totals.total_amount_usd
 
     # --- Req 8.3: auxiliary section labels at their (shifted) cells -----

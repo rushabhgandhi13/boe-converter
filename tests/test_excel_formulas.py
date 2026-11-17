@@ -23,6 +23,8 @@ These tests assert:
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from boe_converter.excel_writer import (
     COL_AMOUNT,
     COL_GST,
@@ -33,10 +35,14 @@ from boe_converter.excel_writer import (
     COL_RATE_OF_INTEREST_BCD,
     COL_RATE_PER_UNIT,
     COL_RATE_PER_USD,
+    COL_SR_NO,
     COL_SURCHARGE,
     COL_TOTAL_CUSTOM_DUTY,
     COL_TOTAL_CUSTOM_DUTY_2,
+    TOTALS_ROW,
     ExcelGenerator,
+    _shift_coord,
+    _totals_row_for,
 )
 from boe_converter.calculator import ValueCalculator
 from boe_converter.models import (
@@ -135,6 +141,37 @@ def test_igst_column_q_is_literal_not_formula():
     assert q == computed.lines[0].igst_amount
 
 
+def test_declared_sws_below_rate_times_base_writes_the_printed_amount():
+    """BE 5083334 item 15: NCCD sits in U but is not surcharged, so the printed
+    SWS (486.2, 10% of BCD only) must be a literal, not ``=U*V`` (2495.23).
+    Q uses the smaller SWS, keeping the IGST total aligned with the BE."""
+    item = replace(
+        _item(1, igst_rate=0.05),
+        assessable_value=_num(24310.67),
+        bcd_amount=_num(4862.1),
+        other_duties_total=_num(24952.3),  # BCD + NCCD
+        sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="486.2", parsed=486.2),
+    )
+    ws, computed = _build([item])
+    r = 13
+
+    assert ws.cell(row=r, column=COL_SURCHARGE).value == 486.2
+    assert ws.cell(row=r, column=COL_GST).value == computed.lines[0].igst_amount
+    expected_igst = 0.05 * (24310.67 + 24952.3 + 486.2)
+    assert abs(computed.lines[0].igst_amount - expected_igst) < 1e-9
+
+
+def test_excel_keeps_printed_sws_when_rate_differs_by_less_than_a_cent():
+    item = replace(
+        _item(1), bcd_amount=_num(100.06), sws_rate=_num(0.1),
+        sws_amount=RawValue(raw_text="10.00", parsed=10),
+    )
+    ws, computed = _build([item])
+    assert computed.lines[0].sws_amount == 10
+    assert ws["W13"].value == 10
+
+
 def test_rate_cells_format_whole_and_fractional_percentages():
     """R/T keep exact values while avoiding rounded or dangling-percent display."""
     ws, _ = _build([_item(1, bcd_rate=0.075, igst_rate=0.18)])
@@ -154,11 +191,16 @@ def test_usd_rate_integer_renders_without_trailing_zero():
 
 def test_totals_row_uses_sum_over_actual_data_rows():
     ws, _ = _build([_item(s) for s in range(1, 4)])  # 3 items -> rows 13..15
-    totals_row = 61
+    # Totals float: two blank rows below the last item (row 18 here).
+    totals_row = _totals_row_for(3)
+    assert totals_row == 18
     assert ws.cell(row=totals_row, column=COL_AMOUNT).value == "=SUM(L13:L15)"
     assert ws.cell(row=totals_row, column=COL_TOTAL_CUSTOM_DUTY).value == "=SUM(P13:P15)"
-    # 'total usd' aux cell mirrors the totals-row L cell.
-    assert ws["E71"].value == f"=L{totals_row}"
+    # The two rows between the items and the totals stay blank.
+    assert ws.cell(row=16, column=COL_SR_NO).value is None
+    assert ws.cell(row=17, column=COL_SR_NO).value is None
+    # 'total usd' aux cell mirrors the totals-row L cell at its shifted spot.
+    assert ws[_shift_coord("E71", totals_row - TOTALS_ROW)].value == f"=L{totals_row}"
 
 
 def test_zero_qty_writes_literal_zero_not_div_formula():

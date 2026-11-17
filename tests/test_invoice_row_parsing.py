@@ -304,3 +304,152 @@ def test_page_without_a_header_yields_nothing():
     data row must not be mistaken for one (it would misplace every column)."""
     page = row(120, 1, ["SILICONE", "SEALANT"], [ctn("1", 120)], 20, "CTN")
     assert parse(page) == {}
+
+
+# ---------------------------------------------------------------------------
+# Invoice value columns (TOTAL QTY / UNIT PRICE / TOTAL AMOUNT)
+# ---------------------------------------------------------------------------
+def _details(*pages) -> dict:
+    return InvoicePackingListParser().parse_line_details(
+        _Doc(*[_Page(words) for words in pages])
+    )
+
+
+def _val(detail, key):
+    v = detail.get(key)
+    return None if v is None else v.parsed
+
+
+def test_value_columns_are_captured_per_row():
+    page = header() + row(120, 1, ["SLIDERS"], [ctn("131", 120)], 4000, "PCS")
+    d = _details(page)[1]
+    assert _val(d, "quantity") == 4000
+    assert _val(d, "unit_price") == 0.5
+    assert _val(d, "amount") == 2000
+
+
+def test_qty_label_printed_beside_total_still_locates_the_column():
+    """``TOTAL QTY`` is two adjacent words on one line and the numbers sit
+    under the whole label, not under ``QTY`` alone (live INV 916 layout)."""
+    page = [
+        W("SR", 30, 40, 100), W("NO", 42, 55, 100),
+        W("DESCRIPTION", 100, 170, 100),
+        W("TOTAL", 300, 325, 100), W("CTNS", 328, 352, 100),
+        W("TOTAL", 396, 432, 100), W("QTY", 435, 458, 100),
+        W("UNIT", 462, 482, 100), W("PRICE", 486, 514, 100),
+        W("AMOUNT", 540, 580, 100),
+        W("1", 30, 38, 120), W("SLIDERS", 100, 150, 120),
+        W("6", 334, 346, 120),
+        W("5700", 398, 424, 120), W("PCS", 440, 458, 120),
+        W("$0.01", 482, 511, 120), W("$57.00", 544, 579, 120),
+    ]
+    d = _details(page)[1]
+    assert _val(d, "quantity") == 5700
+    assert _val(d, "unit_price") == 0.01
+    assert _val(d, "amount") == 57
+
+
+def test_value_cells_with_currency_and_separators():
+    words = (
+        header()
+        + [W("1", 30, 38, 120), W("KEYCHAIN", 100, 160, 120), W("85", 334, 346, 120)]
+        + [W("2913.5", 395, 420, 120), W("DOZ", 440, 458, 120)]
+        + [W("$0.12", 480, 505, 120), W("$1,500.00", 540, 580, 120)]
+    )
+    d = _details(words)[1]
+    assert _val(d, "quantity") == 2913.5
+    assert _val(d, "unit_price") == 0.12
+    assert _val(d, "amount") == 1500.0
+
+
+def test_blank_value_cells_yield_none():
+    words = (
+        header()
+        + [W("1", 30, 38, 120), W("WIRE", 100, 140, 120)]
+        + [W("PCS", 440, 458, 120)]
+    )
+    d = _details(words)[1]
+    assert _val(d, "quantity") is None
+    assert _val(d, "unit_price") is None
+    assert _val(d, "amount") is None
+
+
+def test_value_headers_below_carton_header_read_each_number_only_once():
+    words = [
+        W("SR", 30, 40, 100), W("DESCRIPTION", 100, 170, 100),
+        W("CTNS", 328, 352, 100), W("QTY", 390, 410, 108),
+        W("PRICE", 419, 437, 108), W("AMOUNT", 465, 500, 108),
+        W("1", 30, 38, 125), W("WIRE", 100, 140, 125),
+        W("3", 335, 345, 125), W("100", 405, 421, 125),
+        W("PCS", 440, 458, 125), W("80.00", 465, 500, 125),
+    ]
+    detail = _details(words)[1]
+    assert _val(detail, "quantity") == 100
+    assert _val(detail, "unit_price") is None
+    assert _val(detail, "amount") == 80
+
+
+class _TableRow:
+    def __init__(self, cells, bbox):
+        self.cells = cells
+        self.bbox = bbox
+
+
+class _Table:
+    def __init__(self, data, rows):
+        self._data = data
+        self.rows = rows
+
+    def extract(self):
+        return self._data
+
+
+class _TablePage:
+    def __init__(self, table):
+        self._table = table
+
+    def find_tables(self):
+        return [self._table]
+
+
+def test_merged_ctns_cell_reassigns_a_centered_count_to_the_first_serial():
+    """The invoice merges one CTNS cell over two line rows (live INV 916 items
+    20/21): the value belongs to the first line and records a 2-row span, so the
+    Excel writer can merge the CTN cells instead of double-counting."""
+    data = [
+        ["SR NO", "DESCRIPTION", "TOTAL CTNS", "QTY", "UNIT", "PRICE", "AMOUNT"],
+        ["1", "A", "5", "10", "PCS", "1", "10"],
+        ["2", "B", "1", "20", "PCS", "2", "40"],
+        ["3", "C", None, "30", "PCS", "3", "90"],
+    ]
+
+    def cells(top, bottom):
+        return [
+            (0, top, 30, bottom), (30, top, 330, bottom), (330, top, 380, bottom),
+            (380, top, 430, bottom), (430, top, 470, bottom),
+            (470, top, 520, bottom), (520, top, 600, bottom),
+        ]
+
+    rows = [
+        _TableRow(cells(0, 10), (0, 0, 600, 10)),
+        _TableRow(cells(10, 20), (0, 10, 600, 20)),
+        _TableRow(cells(20, 30), (0, 20, 600, 30)),
+        _TableRow(cells(30, 40), (0, 30, 600, 40)),
+    ]
+    # Row 2's CTNS cell spans rows 2 and 3; row 3's own cell is the merge's.
+    rows[2].cells[2] = (330, 20, 380, 40)
+    rows[3].cells[2] = None
+
+    parser = InvoicePackingListParser()
+    details = {
+        1: {"cartons": None, "description": None},
+        2: {"cartons": None, "description": None},
+        3: {"cartons": parser._carton_value("1"), "description": None},
+    }
+    parser._fill_merged_cartons(_TablePage(_Table(data, rows)), details)
+
+    assert details[1]["cartons"].parsed == 5
+    assert not details[1].get("carton_group")
+    assert details[2]["cartons"].parsed == 1
+    assert details[2]["carton_group"] == (2, 3)
+    assert details[3]["cartons"] is None

@@ -53,8 +53,8 @@ from boe_converter.excel_writer import (
     COL_UNIT_PRICE_USD,
     ITEM_TABLE_FIRST_DATA_ROW,
     SWS_RATE,
-    TOTALS_ROW,
     ExcelGenerator,
+    _totals_row_for,
 )
 from boe_converter.models import (
     ExtractedDocument,
@@ -232,11 +232,12 @@ def test_values_placed_in_mapped_cells_at_full_precision(payload):
         assert cell(COL_LAND_COST_WITH_GST) == line.land_cost_incl_gst
         assert cell(COL_RATE_PER_UNIT) == line.purchase_rate_per_unit
 
-    # --- Totals_Row (row 61): full-precision sums + package count -------
+    # --- Totals_Row (two blanks below the last item) ----------------------
     totals = computed.totals
+    totals_row = _totals_row_for(len(ordered))
 
     def total_cell(col):
-        return ws.cell(row=TOTALS_ROW, column=col).value
+        return ws.cell(row=totals_row, column=col).value
 
     # G: BOE total package/CTN count, carried through verbatim (Req 7.5).
     assert total_cell(COL_CTN) == totals.package_count.parsed

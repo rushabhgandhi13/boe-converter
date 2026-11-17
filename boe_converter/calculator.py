@@ -28,6 +28,7 @@ re-expresses (MTS -> KGS, a weighed tape line -> its piece count).
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 
 from boe_converter import units
@@ -50,6 +51,23 @@ _REQUIRED_LINE_FIELDS = (
     "bcd_amount",
     "igst_rate",
 )
+
+
+def _printed_amount_tolerance(value: RawValue | None) -> float:
+    """Half a unit in the last decimal a BOE money field printed.
+
+    BOE SWS amounts are printed rounded (usually to one decimal). A
+    rate-derived amount that differs from the printed amount by no more than
+    display rounding is the same figure; a larger gap means the rate was
+    applied to a different base than the BOE actually surcharged.
+    """
+    if value is None or value.is_missing or not value.raw_text:
+        return 0.5
+    text = value.raw_text.strip().replace(",", "").lstrip("₹$€£ ").strip()
+    if "." not in text:
+        return 0.5
+    decimals = len(text.split(".", 1)[1])
+    return 0.5 * (10.0 ** -decimals)
 
 
 def _coerce_number(value: object) -> float | None:
@@ -290,6 +308,11 @@ class ValueCalculator:
           not the exact ``21.687``); consuming that pre-rounded amount would
           inject precision loss into IGST and every downstream duty/land-cost
           value. A declared rate of ``0`` (exemption) yields ``0`` (Req 15.3).
+        - The rate only describes the surcharge on the BOE's own SWS base. Some
+          duties in ``cust_aidc`` are not surchargeable (NCCD is excluded), so
+          ``cust_aidc * rate`` can overshoot the printed amount by thousands.
+          When the two disagree beyond the printed amount's display rounding,
+          the printed amount is authoritative and no fallback flag is raised.
         - Else an extracted per-line SWS *amount* (including a declared ``0``
           exemption) is used directly (Req 15.2/15.4) -- e.g. when the BOE prints
           an amount but no resolvable rate, or the customs-duty base is missing.
@@ -302,15 +325,28 @@ class ValueCalculator:
         used if present, otherwise ``None`` is returned (written blank
         downstream).
         """
-        # Prefer the declared SWS *rate* computed on the full-precision customs
-        # base over the BOE's pre-rounded printed amount (Req 16.1).
         sws_rate_extracted = _as_number(getattr(item, "sws_rate", None))
+        sws_amount_extracted = _as_number(getattr(item, "sws_amount", None))
+        # Prefer the declared SWS *rate* computed on the full-precision customs
+        # base over the BOE's pre-rounded printed amount (Req 16.1), unless the
+        # rate's base is demonstrably not the one the BOE surcharged.
         if sws_rate_extracted is not None and cust_aidc is not None:
-            return cust_aidc * sws_rate_extracted, False
+            derived = cust_aidc * sws_rate_extracted
+            if (
+                sws_amount_extracted is not None
+                and not math.isclose(
+                    derived,
+                    sws_amount_extracted,
+                    rel_tol=0,
+                    abs_tol=_printed_amount_tolerance(getattr(item, "sws_amount", None))
+                    + 1e-6,
+                )
+            ):
+                return sws_amount_extracted, False
+            return derived, False
 
         # Fall back to the declared amount (rate absent, or no base to apply it
         # to); a declared ``0`` exemption is honoured as ``0`` (Req 15.4).
-        sws_amount_extracted = _as_number(getattr(item, "sws_amount", None))
         if sws_amount_extracted is not None:
             return sws_amount_extracted, False
 

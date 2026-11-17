@@ -205,7 +205,7 @@ def test_old_format_end_to_end_conversion():
         ws = wb["Sheet1"]
         n = 122
         last_data_row = 13 + n - 1            # 134
-        totals_row = 61 + max(0, last_data_row - 60)  # 135
+        totals_row = last_data_row + 3       # two blanks, then totals (137)
         # Dense item rows 1..122 with no overlap, totals below the last item.
         assert ws.cell(row=13, column=1).value == 1
         assert ws.cell(row=last_data_row, column=1).value == 122

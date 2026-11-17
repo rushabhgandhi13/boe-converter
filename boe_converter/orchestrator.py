@@ -37,6 +37,7 @@ Design references: design.md "Conversion Orchestrator", "Error Handling"
 from __future__ import annotations
 
 import logging
+import math
 import secrets
 import time
 from dataclasses import dataclass, field, replace
@@ -52,11 +53,13 @@ from boe_converter.models import (
     ExtractedDocument,
     GrandTotalCheck,
     GrandTotalVerification,
+    LineItem,
     RawValue,
     ReviewFlag,
     ReviewFlagSet,
 )
 from boe_converter.parser import PdfParser
+from boe_converter.units import tape_pcs_override
 from boe_converter.validator import UploadValidator
 
 logger = logging.getLogger(__name__)
@@ -135,6 +138,36 @@ def _as_number(rv: RawValue | None) -> float | None:
     if isinstance(parsed, (int, float)):
         return float(parsed)
     return None
+
+
+def _detail_number(detail: dict, key: str) -> float | None:
+    """Numeric invoice value for ``key`` (else ``None``).
+
+    Guards against hand-built detail mappings in tests carrying plain numbers:
+    only a ``RawValue`` is interpreted, anything else counts as absent.
+    """
+    value = detail.get(key)
+    return _as_number(value) if isinstance(value, RawValue) else None
+
+
+def _printed_precision_tolerance(value: RawValue | None) -> float:
+    """Half a unit in the last decimal the invoice actually printed.
+
+    The invoice prints unit prices rounded to a fixed number of decimals
+    (``0.025`` as ``0.03``). Comparing such a printed price to the BOE's
+    full-precision value at a sub-paisa tolerance flags pure display rounding,
+    so the allowed difference is half the last printed decimal - capped at half
+    a cent, since invoice money never resolves finer than cents. A value with no
+    decimal point (an integer price) also gets the half-cent cap, so a genuine
+    price difference still flags.
+    """
+    if value is None or value.is_missing or not value.raw_text:
+        return 0.005
+    text = value.raw_text.strip().replace(",", "").lstrip("$₹€£ ").strip()
+    if "." not in text:
+        return 0.005
+    decimals = len(text.split(".", 1)[1])
+    return min(0.5 * (10.0 ** -decimals), 0.005)
 
 
 class ConversionOrchestrator:
@@ -278,10 +311,21 @@ class ConversionOrchestrator:
         column ``G``) and overrides the description with the invoice's
         ``DESCRIPTION OF GOODS`` (Excel column ``E`` / the stock name), which the
         user prefers over the terser BOE description when an invoice is supplied.
+        When the invoice merges a CTNS cell over several lines (a shared carton
+        group), the group's first line carries the count plus its ``carton_group``
+        so the Excel writer merges column G over the same rows and the total
+        counts the group once.
         Lines absent from the invoice keep their BOE values. Any failure
         (unreadable invoice, unexpected layout) is swallowed and logged - the BOE
         conversion proceeds unchanged so an optional, malformed invoice never
         fails the whole conversion.
+
+        For every matched line the BOE quantity, unit price and amount are also
+        compared against the invoice's TOTAL QTY / UNIT PRICE / TOTAL AMOUNT;
+        differing fields are recorded on the line (``invoice_mismatch``) so the
+        Excel generator can red-fill that row. A field is only compared when
+        both sides are numeric - anything missing or unreadable skips that
+        field's comparison instead of flagging it.
         """
         try:
             import io
@@ -303,12 +347,80 @@ class ConversionOrchestrator:
             changes = {}
             if detail.get("cartons") is not None:
                 changes["cartons"] = detail["cartons"]
+            group = detail.get("carton_group")
+            if group:
+                changes["carton_group"] = group
             # When the invoice provides a description for this line, it takes
             # precedence over the BOE description (Excel column E / stock name).
             if detail.get("description") is not None:
                 changes["description"] = detail["description"]
+            mismatched = self._invoice_value_mismatches(item, detail)
+            if mismatched:
+                changes["invoice_mismatch"] = mismatched
             new_items.append(replace(item, **changes) if changes else item)
         return replace(extracted, line_items=new_items)
+
+    @staticmethod
+    def _invoice_value_mismatches(
+        item: LineItem, detail: dict
+    ) -> tuple[str, ...]:
+        """Names of BOE-vs-invoice value fields that differ for one line.
+
+        Compares quantity, unit price, and amount (the BOE amount is
+        ``unit_price x quantity`` recomputed here; the BOE prints no per-line
+        amount field). A field only counts when both sides are numeric:
+
+        - **Quantity** is strict (sub-unit dust only) and skipped for a weighed
+          tape line, where the BOE books the weight while the invoice counts
+          pieces (``tape_pcs_override``); those quantities legitimately differ.
+        - **Unit price** allows half a unit in the last decimal the invoice
+          printed, capped at half a cent (``_printed_precision_tolerance``):
+          an invoice printing ``0.025`` as ``0.03`` is display rounding, not a
+          value difference.
+        - **Amount** allows half a cent for the same reason (``8333.5 x 0.15 =
+          1250.025`` printed as ``1250.03``).
+
+        Returns ``()`` when nothing differs.
+        """
+        boe_qty = _as_number(item.quantity)
+        boe_price = _as_number(item.unit_price_usd)
+        boe_amount = (
+            boe_price * boe_qty
+            if boe_price is not None and boe_qty is not None
+            else None
+        )
+        mismatched: list[str] = []
+        inv_qty = _detail_number(detail, "quantity")
+        weighed_tape = (
+            tape_pcs_override(
+                getattr(item.description, "parsed", None),
+                getattr(item.unit, "parsed", None),
+            )
+            is not None
+        )
+        if (
+            not weighed_tape
+            and boe_qty is not None
+            and inv_qty is not None
+            and not math.isclose(boe_qty, inv_qty, rel_tol=1e-9, abs_tol=1e-6)
+        ):
+            mismatched.append("quantity")
+        inv_price = _detail_number(detail, "unit_price")
+        if (
+            boe_price is not None
+            and inv_price is not None
+            and not math.isclose(
+                boe_price, inv_price, rel_tol=0,
+                abs_tol=_printed_precision_tolerance(detail["unit_price"]) + 1e-6,
+            )
+        ):
+            mismatched.append("unit_price_usd")
+        inv_amount = _detail_number(detail, "amount")
+        if boe_amount is not None and inv_amount is not None and not math.isclose(
+            boe_amount, inv_amount, rel_tol=0, abs_tol=0.005 + 1e-6
+        ):
+            mismatched.append("amount_usd")
+        return tuple(mismatched)
 
     # ------------------------------------------------------------------
     # Download token store
